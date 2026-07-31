@@ -2,6 +2,7 @@ import os
 import re
 import threading
 import logging
+import requests
 
 from youtube_transcript_api import YouTubeTranscriptApi
 from flask import Flask
@@ -37,27 +38,89 @@ def fmt_time(seconds: float) -> str:
     m, s = divmod(int(seconds), 60)
     return f"{m:02d}:{s:02d}"
 
-def fetch_transcript_safe(video_id: str):
-    """Fungsi pelindung agar kompatibel dengan semua versi youtube-transcript-api"""
-    # Cara 1: Standard Class Method
-    if hasattr(YouTubeTranscriptApi, 'get_transcript'):
-        return YouTubeTranscriptApi.get_transcript(video_id, languages=['id', 'en', 'id-ID'])
-    
-    # Cara 2: Instance Method (Fallback)
-    api_instance = YouTubeTranscriptApi()
-    if hasattr(api_instance, 'get_transcript'):
-        return api_instance.get_transcript(video_id, languages=['id', 'en', 'id-ID'])
-    
-    # Cara 3: List Transcripts (Fallback 2)
-    if hasattr(YouTubeTranscriptApi, 'list_transcripts'):
-        tx_list = YouTubeTranscriptApi.list_transcripts(video_id)
+def parse_vtt_timestamp(ts_str: str) -> float:
+    parts = ts_str.strip().split(':')
+    if len(parts) == 3:
+        h, m, s = parts
+        return int(h)*3600 + int(m)*60 + float(s.replace(',', '.'))
+    elif len(parts) == 2:
+        m, s = parts
+        return int(m)*60 + float(s.replace(',', '.'))
+    return 0.0
+
+def parse_vtt_subtitles(vtt_text: str) -> list:
+    lines = vtt_text.splitlines()
+    segments = []
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if '-->' in line:
+            times = line.split('-->')
+            start = parse_vtt_timestamp(times[0])
+            end = parse_vtt_timestamp(times[1].split()[0])
+            
+            i += 1
+            text_lines = []
+            while i < len(lines) and lines[i].strip() and '-->' not in lines[i]:
+                clean_line = re.sub(r'<[^>]+>', '', lines[i].strip())
+                if clean_line:
+                    text_lines.append(clean_line)
+                i += 1
+            
+            text = " ".join(text_lines)
+            if text:
+                segments.append({
+                    'start': start,
+                    'duration': max(0.5, end - start),
+                    'text': text
+                })
+        else:
+            i += 1
+    return segments
+
+def get_transcript_piped_proxy(video_id: str) -> list:
+    """Mengambil transkrip lewat Jaringan Piped Proxy untuk menembus IP Block YouTube 429."""
+    piped_instances = [
+        "https://api.piped.privacydev.net",
+        "https://pipedapi.kavin.rocks",
+        "https://piped-api.garudalinux.org",
+        "https://pipedapi.mha.fi"
+    ]
+
+    for instance in piped_instances:
         try:
-            tx = tx_list.find_transcript(['id', 'en', 'id-ID'])
-        except Exception:
-            tx = tx_list.find_generated_transcript(['id', 'en', 'id-ID'])
-        return tx.fetch()
-        
-    raise RuntimeError("Metode pengambil transkrip tidak ditemukan pada library.")
+            logger.info(f"Mencoba mengambil transkrip dari Piped Proxy: {instance}")
+            url = f"{instance}/streams/{video_id}"
+            r = requests.get(url, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                subtitles = data.get("subtitles", [])
+                if not subtitles:
+                    continue
+                
+                # Cari bahasa Indonesia, Inggris, atau subtitle apa saja yang ada
+                target_sub = None
+                for sub in subtitles:
+                    code = sub.get("code", "").lower()
+                    if code in ["id", "ind", "id-id"]:
+                        target_sub = sub
+                        break
+                if not target_sub:
+                    target_sub = subtitles[0] # Ambil subtitle pertama yang ada
+                
+                sub_url = target_sub.get("url")
+                if sub_url:
+                    sub_req = requests.get(sub_url, timeout=10)
+                    if sub_req.status_code == 200:
+                        parsed = parse_vtt_subtitles(sub_req.text)
+                        if parsed:
+                            logger.info("Berhasil mengambil transkrip via Piped Proxy!")
+                            return parsed
+        except Exception as e:
+            logger.warning(f"Gagal mengambil dari {instance}: {e}")
+
+    # Fallback ke youtube-transcript-api standar jika proxy tidak merespon
+    return YouTubeTranscriptApi.get_transcript(video_id, languages=['id', 'en', 'id-ID'])
 
 async def process_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_url: str):
     video_id = extract_video_id(raw_url)
@@ -65,10 +128,10 @@ async def process_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE, ra
         await update.message.reply_text("❌ Link YouTube tidak valid!")
         return
 
-    await update.message.reply_text("⚡ [GitHub Server] Mengambil transkrip teks langsung...")
+    await update.message.reply_text("⚡ [Bypass Server] Mengambil transkrip teks...")
 
     try:
-        transcript_list = fetch_transcript_safe(video_id)
+        transcript_list = get_transcript_piped_proxy(video_id)
         
         segment_lines = []
         for item in transcript_list:
