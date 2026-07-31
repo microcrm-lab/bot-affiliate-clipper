@@ -134,67 +134,70 @@ def get_captions_from_web(video_id: str) -> list:
             
     raise RuntimeError("Tidak ada subtitle bawaan.")
 
-def download_media_ytdlp(video_id: str) -> str:
-    """Download media tanpa membatasi format (100% bebas dari error Requested format is not available)"""
-    out_tmpl = os.path.join(TEMP_DIR, f"{uuid.uuid4().hex}.%(ext)s")
-    
+def download_direct_stream(video_id: str) -> str:
+    """Gunakan yt-dlp HANYA untuk extract URL direct stream, lalu download via requests (Bypass FFmpeg)"""
     cookie_candidate = None
     for candidate in ["cookies.txt", "cookies.txt.txt", "youtube_cookies.txt"]:
         if os.path.exists(candidate):
             cookie_candidate = candidate
             break
 
-    # JANGAN ISI parameter 'format' agar yt-dlp memilih format default YouTube secara bebas
     ydl_opts = {
-        'outtmpl': out_tmpl,
         'quiet': True,
         'no_warnings': True,
         'nocheckcertificate': True,
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['android', 'ios', 'mweb']
-            }
-        }
     }
-
     if cookie_candidate:
         ydl_opts['cookiefile'] = cookie_candidate
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=True)
-            downloaded_file = ydl.prepare_filename(info)
+    logger.info(f"Mengekstrak direct URL untuk video {video_id}...")
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        # download=False agar tidak memakai FFmpeg/Downloader yt-dlp internal
+        info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
 
-        if downloaded_file and os.path.exists(downloaded_file) and os.path.getsize(downloaded_file) > 1000:
-            logger.info("Berhasil mengunduh media via yt-dlp!")
-            return downloaded_file
-    except Exception as e:
-        logger.error(f"yt-dlp primary error: {e}")
-        # Fallback cadangan: Menggunakan client default web + cookie
-        try:
-            ydl_opts_fallback = {
-                'outtmpl': out_tmpl,
-                'quiet': True,
-                'no_warnings': True,
-                'nocheckcertificate': True,
-            }
-            if cookie_candidate:
-                ydl_opts_fallback['cookiefile'] = cookie_candidate
-            
-            with yt_dlp.YoutubeDL(ydl_opts_fallback) as ydl:
-                info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=True)
-                downloaded_file = ydl.prepare_filename(info)
+    formats = info.get('formats', [])
+    if not formats:
+        raise RuntimeError("Stream format tidak ditemukan.")
 
-            if downloaded_file and os.path.exists(downloaded_file) and os.path.getsize(downloaded_file) > 1000:
-                return downloaded_file
-        except Exception as e2:
-            status_cookie = "Terdeteksi" if cookie_candidate else "TIDAK Terdeteksi"
-            raise RuntimeError(f"Detail yt-dlp error: `{e2}` | Cookie: `{status_cookie}`")
+    # Cari audio murni
+    selected_format = next(
+        (f for f in formats if f.get('vcodec') == 'none' and f.get('acodec') != 'none' and f.get('url')),
+        None
+    )
 
-    raise RuntimeError("File media tidak berhasil dibuat.")
+    # Fallback: Cari format video+audio biasa jika audio murni tidak ada
+    if not selected_format:
+        selected_format = next(
+            (f for f in formats if f.get('acodec') != 'none' and f.get('url')),
+            None
+        )
+
+    if not selected_format or not selected_format.get('url'):
+        raise RuntimeError("Gagal mendapatkan link direct stream audio.")
+
+    stream_url = selected_format['url']
+    ext = selected_format.get('ext', 'm4a')
+    http_headers = selected_format.get('http_headers', {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    })
+
+    out_path = os.path.join(TEMP_DIR, f"{uuid.uuid4().hex}.{ext}")
+    logger.info(f"Mengunduh stream audio via Requests ke {out_path}...")
+
+    resp = requests.get(stream_url, headers=http_headers, stream=True, timeout=60)
+    if resp.status_code == 200:
+        with open(out_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
+            logger.info("Direct stream download sukses!")
+            return out_path
+
+    raise RuntimeError(f"Gagal mengunduh audio dari server YouTube (HTTP {resp.status_code}).")
 
 def transcribe_with_groq_whisper(media_path: str) -> list:
-    """Groq Whisper AI bisa membaca file media (MP4/WebM/M4A) secara langsung!"""
+    """Groq Whisper AI membaca file M4A/WebM/MP4 secara presisi!"""
     with open(media_path, "rb") as f:
         response = groq_client.audio.transcriptions.create(
             file=(os.path.basename(media_path), f),
@@ -237,10 +240,10 @@ async def process_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE, ra
         except Exception:
             pass
 
-        # 2. Fallback: Download Media (yt-dlp + Cookies) + Groq Whisper AI
+        # 2. Fallback: Direct Stream Download + Groq Whisper AI
         if not transcript_list:
-            await update.message.reply_text("🎙️ Video tidak punya subtitle bawaan. Mengunduh media & memproses suara dengan Groq Whisper AI...")
-            media_path = download_media_ytdlp(video_id)
+            await update.message.reply_text("🎙️ Video tidak punya subtitle bawaan. Mengunduh stream audio & memproses dengan Groq Whisper AI...")
+            media_path = download_direct_stream(video_id)
             transcript_list = transcribe_with_groq_whisper(media_path)
 
         if not transcript_list:
