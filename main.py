@@ -112,32 +112,69 @@ def get_transcript_proxy(video_id: str) -> list:
             pass
     raise RuntimeError("No CC found on proxy")
 
-def download_audio_cobalt(raw_url: str) -> str:
-    instances = [
-        "https://api.cobalt.tools",
-        "https://cobalt-api.kwippy.com",
-        "https://api.cobalt.vmn.sh"
+def download_audio_proxy_stream(video_id: str) -> str:
+    """Download audio stream m4a/webm langsung dari Piped & Invidious Proxy."""
+    
+    # 1. Piped API Stream Audio
+    piped_instances = [
+        "https://api.piped.yt",
+        "https://pipedapi.adminforge.de",
+        "https://api.piped.privacydev.net",
+        "https://pipedapi.kavin.rocks"
     ]
-    payload = {"url": raw_url, "isAudioOnly": True}
-    headers = {"Accept": "application/json", "Content-Type": "application/json"}
 
-    for instance in instances:
+    for instance in piped_instances:
         try:
-            r = requests.post(f"{instance}/", json=payload, headers=headers, timeout=12)
+            logger.info(f"Mencoba stream audio dari Piped: {instance}")
+            url = f"{instance}/streams/{video_id}"
+            r = requests.get(url, timeout=8)
             if r.status_code == 200:
-                data = r.json()
-                audio_url = data.get("url")
-                if audio_url:
-                    out_path = os.path.join(TEMP_DIR, f"{uuid.uuid4().hex}.mp3")
-                    audio_req = requests.get(audio_url, stream=True, timeout=60)
-                    with open(out_path, "wb") as f:
-                        for chunk in audio_req.iter_content(chunk_size=1024*1024):
-                            f.write(chunk)
-                    if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-                        return out_path
+                audio_streams = r.json().get("audioStreams", [])
+                if audio_streams:
+                    stream_url = audio_streams[0].get("url")
+                    if stream_url:
+                        out_path = os.path.join(TEMP_DIR, f"{uuid.uuid4().hex}.m4a")
+                        audio_req = requests.get(stream_url, stream=True, timeout=60)
+                        if audio_req.status_code == 200:
+                            with open(out_path, "wb") as f:
+                                for chunk in audio_req.iter_content(chunk_size=1024*1024):
+                                    f.write(chunk)
+                            if os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
+                                logger.info("Berhasil mengunduh audio stream!")
+                                return out_path
         except Exception as e:
-            logger.warning(f"Cobalt error: {e}")
-    raise RuntimeError("Gagal mengambil audio dari video ini.")
+            logger.warning(f"Gagal audio Piped {instance}: {e}")
+
+    # 2. Invidious API Adaptive Audio Formats
+    invidious_instances = [
+        "https://invidious.nerdvpn.de",
+        "https://inv.us.projectsegfau.lt",
+        "https://invidious.drgns.space"
+    ]
+
+    for instance in invidious_instances:
+        try:
+            logger.info(f"Mencoba stream audio dari Invidious: {instance}")
+            url = f"{instance}/api/v1/videos/{video_id}"
+            r = requests.get(url, timeout=8)
+            if r.status_code == 200:
+                adaptive_formats = r.json().get("adaptiveFormats", [])
+                for fmt in adaptive_formats:
+                    if "audio" in fmt.get("type", ""):
+                        stream_url = fmt.get("url")
+                        if stream_url:
+                            out_path = os.path.join(TEMP_DIR, f"{uuid.uuid4().hex}.m4a")
+                            audio_req = requests.get(stream_url, stream=True, timeout=60)
+                            if audio_req.status_code == 200:
+                                with open(out_path, "wb") as f:
+                                    for chunk in audio_req.iter_content(chunk_size=1024*1024):
+                                        f.write(chunk)
+                                if os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
+                                    return out_path
+        except Exception as e:
+            logger.warning(f"Gagal audio Invidious {instance}: {e}")
+
+    raise RuntimeError("Gagal mengambil file audio dari proxy.")
 
 def transcribe_with_groq_whisper(audio_path: str) -> list:
     with open(audio_path, "rb") as f:
@@ -173,14 +210,14 @@ async def process_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE, ra
     audio_path = None
 
     try:
-        # 1. Coba ambil Subtitle Bawaan (Cepat & Hemat)
+        # 1. Coba Subtitle Bawaan
         try:
             transcript_list = get_transcript_proxy(video_id)
-            logger.info("Transkrip berhasil didapatkan via Subtitle Bawaan!")
+            logger.info("Transkrip dari Subtitle Bawaan berhasil!")
         except Exception:
-            # 2. Fallback jika video gak punya subtitle bawaan -> Download Audio & Pakai Groq Whisper
+            # 2. Fallback: Download Audio Stream & Groq Whisper AI
             await update.message.reply_text("🎙️ Video tidak punya subtitle bawaan. Memproses suara dengan Groq Whisper AI...")
-            audio_path = download_audio_cobalt(f"https://www.youtube.com/watch?v={video_id}")
+            audio_path = download_audio_proxy_stream(video_id)
             transcript_list = transcribe_with_groq_whisper(audio_path)
 
         if not transcript_list:
