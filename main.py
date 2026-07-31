@@ -4,6 +4,7 @@ import uuid
 import threading
 import logging
 import requests
+import xml.etree.ElementTree as ET
 
 from flask import Flask
 from groq import Groq
@@ -42,136 +43,93 @@ def fmt_time(seconds: float) -> str:
     m, s = divmod(int(seconds), 60)
     return f"{m:02d}:{s:02d}"
 
-def parse_vtt_timestamp(ts_str: str) -> float:
-    parts = ts_str.strip().split(':')
-    if len(parts) == 3:
-        h, m, s = parts
-        return int(h)*3600 + int(m)*60 + float(s.replace(',', '.'))
-    elif len(parts) == 2:
-        m, s = parts
-        return int(m)*60 + float(s.replace(',', '.'))
-    return 0.0
+def get_youtube_innertube_data(video_id: str) -> dict:
+    """Mengambil data Player resmi YouTube menggunakan identitas Android Client (Bypass 429/CAPTCHA)"""
+    url = "https://www.youtube.com/youtubei/v1/player"
+    payload = {
+        "context": {
+            "client": {
+                "clientName": "ANDROID",
+                "clientVersion": "19.08.35",
+                "androidSdkVersion": 30,
+                "hl": "id",
+                "gl": "ID"
+            }
+        },
+        "videoId": video_id
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "com.google.android.youtube/19.08.35 (Linux; U; Android 11; id_ID)"
+    }
+    r = requests.post(url, json=payload, headers=headers, timeout=10)
+    if r.status_code == 200:
+        return r.json()
+    raise RuntimeError(f"YouTube Innertube HTTP {r.status_code}")
 
-def parse_vtt_subtitles(vtt_text: str) -> list:
-    lines = vtt_text.splitlines()
+def extract_innertube_captions(player_data: dict) -> list:
+    """Ekstrak subtitle/auto-generated captions dari data Innertube"""
+    captions = player_data.get("captions", {}).get("playerCaptionsTracklistRenderer", {}).get("captionTracks", [])
+    if not captions:
+        raise RuntimeError("Tidak ada subtitle bawaan.")
+
+    # Prioritas: Bahasa Indonesia -> Inggris -> Subtitle pertama yang ada
+    target = next((c for c in captions if c.get("languageCode") in ["id", "ind"]), None)
+    if not target:
+        target = next((c for c in captions if c.get("languageCode") in ["en", "eng"]), captions[0])
+
+    base_url = target.get("baseUrl")
+    if not base_url:
+        raise RuntimeError("URL subtitle kosong.")
+
+    xml_req = requests.get(base_url, timeout=10)
+    if xml_req.status_code != 200:
+        raise RuntimeError("Gagal mengunduh XML subtitle.")
+
+    # Parse XML Subtitle YouTube
+    root = ET.fromstring(xml_req.text)
     segments = []
-    i = 0
-    while i < len(lines):
-        line = lines[i].strip()
-        if '-->' in line:
-            times = line.split('-->')
-            start = parse_vtt_timestamp(times[0])
-            end = parse_vtt_timestamp(times[1].split()[0])
-            
-            i += 1
-            text_lines = []
-            while i < len(lines) and lines[i].strip() and '-->' not in lines[i]:
-                clean_line = re.sub(r'<[^>]+>', '', lines[i].strip())
-                if clean_line:
-                    text_lines.append(clean_line)
-                i += 1
-            
-            text = " ".join(text_lines)
-            if text:
-                segments.append({
-                    'start': start,
-                    'duration': max(0.5, end - start),
-                    'text': text
-                })
-        else:
-            i += 1
+    for text_node in root.findall('text'):
+        start = float(text_node.attrib.get('start', 0))
+        dur = float(text_node.attrib.get('dur', 1))
+        txt = text_node.text or ""
+        txt = txt.replace('\n', ' ').strip()
+        if txt:
+            segments.append({
+                'start': start,
+                'duration': dur,
+                'text': txt
+            })
     return segments
 
-def get_captions_from_invidious(video_id: str) -> list:
-    """Mengambil Auto-Generated Captions via Invidious Instances"""
-    instances = [
-        "https://inv.us.projectsegfau.lt",
-        "https://invidious.nerdvpn.de",
-        "https://invidious.drgns.space",
-        "https://inv.tux.pizza"
-    ]
+def download_innertube_audio(player_data: dict) -> str:
+    """Download stream audio langsung dari YouTube Android API jika video tidak punya subtitle"""
+    streaming_data = player_data.get("streamingData", {})
+    adaptive_formats = streaming_data.get("adaptiveFormats", [])
+    
+    audio_format = next((f for f in adaptive_formats if "audio" in f.get("mimeType", "") and "url" in f), None)
+    if not audio_format:
+        # Cari format audio lain yang memiliki URL langsung
+        for fmt in adaptive_formats:
+            if "audio" in fmt.get("mimeType", "") and fmt.get("url"):
+                audio_format = fmt
+                break
 
-    for instance in instances:
-        try:
-            url = f"{instance}/api/v1/captions/{video_id}"
-            r = requests.get(url, timeout=6)
-            if r.status_code == 200:
-                captions = r.json().get("captions", [])
-                if captions:
-                    # Priority: Indonesian -> English -> First Available
-                    target = next((c for c in captions if c.get("languageCode") in ["id", "ind"]), None)
-                    if not target:
-                        target = next((c for c in captions if c.get("languageCode") in ["en", "eng"]), captions[0])
-                    
-                    sub_url = target.get("url")
-                    if sub_url:
-                        full_sub_url = f"{instance}{sub_url}" if sub_url.startswith("/") else sub_url
-                        vtt_req = requests.get(full_sub_url, timeout=6)
-                        if vtt_req.status_code == 200:
-                            parsed = parse_vtt_subtitles(vtt_req.text)
-                            if parsed:
-                                logger.info(f"Berhasil ambil subtitle via Invidious ({instance})")
-                                return parsed
-        except Exception as e:
-            logger.warning(f"Invidious caption failed ({instance}): {e}")
-    raise RuntimeError("Invidious no captions")
+    if not audio_format or not audio_format.get("url"):
+        raise RuntimeError("Stream audio tidak ditemukan pada video ini.")
 
-def get_captions_from_piped(video_id: str) -> list:
-    """Mengambil Subtitle/Auto-CC via Piped API"""
-    instances = [
-        "https://api.piped.yt",
-        "https://pipedapi.adminforge.de",
-        "https://api.piped.privacydev.net",
-        "https://pipedapi.kavin.rocks"
-    ]
+    audio_url = audio_format["url"]
+    out_path = os.path.join(TEMP_DIR, f"{uuid.uuid4().hex}.m4a")
 
-    for instance in instances:
-        try:
-            url = f"{instance}/streams/{video_id}"
-            r = requests.get(url, timeout=6)
-            if r.status_code == 200:
-                subtitles = r.json().get("subtitles", [])
-                if subtitles:
-                    target = next((s for s in subtitles if s.get("code","").lower() in ["id","ind","id-id"]), subtitles[0])
-                    sub_url = target.get("url")
-                    if sub_url:
-                        sub_req = requests.get(sub_url, timeout=6)
-                        if sub_req.status_code == 200:
-                            parsed = parse_vtt_subtitles(sub_req.text)
-                            if parsed:
-                                logger.info(f"Berhasil ambil subtitle via Piped ({instance})")
-                                return parsed
-        except Exception as e:
-            logger.warning(f"Piped caption failed ({instance}): {e}")
-    raise RuntimeError("Piped no captions")
+    audio_req = requests.get(audio_url, stream=True, timeout=60)
+    if audio_req.status_code == 200:
+        with open(out_path, "wb") as f:
+            for chunk in audio_req.iter_content(chunk_size=1024*1024):
+                f.write(chunk)
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
+            return out_path
 
-def download_audio_cobalt_fallback(raw_url: str) -> str:
-    """Download audio menggunakan Cobalt Public Endpoints"""
-    instances = [
-        "https://api.cobalt.tools",
-        "https://cobalt-api.kwippy.com",
-        "https://co.wuk.sh"
-    ]
-    payload = {"url": raw_url, "isAudioOnly": True}
-    headers = {"Accept": "application/json", "Content-Type": "application/json"}
-
-    for instance in instances:
-        try:
-            r = requests.post(f"{instance}/", json=payload, headers=headers, timeout=10)
-            if r.status_code == 200:
-                audio_url = r.json().get("url")
-                if audio_url:
-                    out_path = os.path.join(TEMP_DIR, f"{uuid.uuid4().hex}.mp3")
-                    audio_req = requests.get(audio_url, stream=True, timeout=30)
-                    if audio_req.status_code == 200:
-                        with open(out_path, "wb") as f:
-                            for chunk in audio_req.iter_content(chunk_size=1024*1024):
-                                f.write(chunk)
-                        if os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
-                            return out_path
-        except Exception:
-            pass
-    raise RuntimeError("Gagal mengambil audio dari server.")
+    raise RuntimeError("Gagal mengunduh stream audio dari YouTube.")
 
 def transcribe_with_groq_whisper(audio_path: str) -> list:
     with open(audio_path, "rb") as f:
@@ -203,29 +161,25 @@ async def process_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE, ra
         await update.message.reply_text("❌ Link YouTube tidak valid!")
         return
 
-    await update.message.reply_text("⚡ [Ultra-Bypass System] Memproses teks video...")
+    await update.message.reply_text("⚡ [Android Engine] Menghubungi server YouTube...")
     audio_path = None
 
     try:
+        # Ambil metadata & player data via Innertube API Android
+        player_data = get_youtube_innertube_data(video_id)
         transcript_list = None
-        
-        # 1. Coba ambil Auto-Caption via Invidious Proxy
+
+        # 1. Coba Ambil Captions / Subtitle Otomatis
         try:
-            transcript_list = get_captions_from_invidious(video_id)
-        except Exception:
-            pass
+            transcript_list = extract_innertube_captions(player_data)
+            logger.info("Berhasil mengambil subtitle via Innertube Android!")
+        except Exception as e:
+            logger.info(f"Captions tidak tersedia: {e}")
 
-        # 2. Coba ambil Subtitle via Piped Proxy
+        # 2. Fallback: Download Stream Audio + Groq Whisper AI jika 0 Subtitle
         if not transcript_list:
-            try:
-                transcript_list = get_captions_from_piped(video_id)
-            except Exception:
-                pass
-
-        # 3. Fallback ke Groq Whisper AI jika tidak ada caption sama sekali
-        if not transcript_list:
-            await update.message.reply_text("🎙️ Mengunduh suara & memproses dengan Groq Whisper AI...")
-            audio_path = download_audio_cobalt_fallback(f"https://www.youtube.com/watch?v={video_id}")
+            await update.message.reply_text("🎙️ Mengunduh audio resmi & memproses dengan Groq Whisper AI...")
+            audio_path = download_innertube_audio(player_data)
             transcript_list = transcribe_with_groq_whisper(audio_path)
 
         if not transcript_list:
