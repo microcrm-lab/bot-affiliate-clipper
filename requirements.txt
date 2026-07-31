@@ -3,3 +3,4 @@ groq
 youtube-transcript-api
 Flask
 requests
+yt-dlp
