@@ -8,7 +8,7 @@ import requests
 import yt_dlp
 import static_ffmpeg
 
-# Pasang FFmpeg otomatis ke sistem
+# Pasang FFmpeg otomatis ke PATH sistem
 static_ffmpeg.add_paths()
 
 from flask import Flask
@@ -225,7 +225,7 @@ def transcribe_with_groq_whisper(media_path: str) -> list:
     return segments
 
 def download_video_clip(video_id: str, start_str: str, end_str: str) -> str:
-    """Memotong bagian video klip sesuai timestamp menggunakan FFmpeg & yt-dlp"""
+    """Memotong bagian video klip sesuai timestamp menggunakan FFmpeg & yt-dlp multi-fallback"""
     out_tmpl = os.path.join(TEMP_DIR, f"clip_{uuid.uuid4().hex}.mp4")
     
     cookie_candidate = None
@@ -234,34 +234,47 @@ def download_video_clip(video_id: str, start_str: str, end_str: str) -> str:
             cookie_candidate = candidate
             break
 
-    # Format timestamp ke format hh:mm:ss/mm:ss untuk yt-dlp
-    download_section = f"*{start_str}-{end_str}"
+    start_sec = parse_vtt_timestamp(start_str)
+    end_sec = parse_vtt_timestamp(end_str)
 
-    ydl_opts = {
-        'format': 'b/best', # Ambil MP4 pre-merged
-        'outtmpl': out_tmpl,
-        'quiet': True,
-        'no_warnings': True,
-        'nocheckcertificate': True,
-        'download_ranges': yt_dlp.utils.download_range_func(None, [(parse_vtt_timestamp(start_str), parse_vtt_timestamp(end_str))]),
-        'force_keyframes_at_cuts': True,
-    }
+    # Format multi-stream fleksibel (Bypass error Requested format is not available)
+    format_options = [
+        'bv*+ba*/b/best', # Gabung video + audio via FFmpeg
+        'b/best',         # Fallback pre-merged
+        None              # Auto default yt-dlp
+    ]
 
-    if cookie_candidate:
-        ydl_opts['cookiefile'] = cookie_candidate
+    last_err = None
+    for fmt in format_options:
+        ydl_opts = {
+            'outtmpl': out_tmpl,
+            'quiet': True,
+            'no_warnings': True,
+            'nocheckcertificate': True,
+            'download_ranges': yt_dlp.utils.download_range_func(None, [(start_sec, end_sec)]),
+            'force_keyframes_at_cuts': True,
+        }
+        if fmt:
+            ydl_opts['format'] = fmt
+        if cookie_candidate:
+            ydl_opts['cookiefile'] = cookie_candidate
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
 
-    if os.path.exists(out_tmpl) and os.path.getsize(out_tmpl) > 1000:
-        return out_tmpl
-    
-    # Fallback pencarian file MP4 jika nama file terasosiasi ekstensi lain
-    for f in os.listdir(TEMP_DIR):
-        if f.startswith("clip_") and os.path.getsize(os.path.join(TEMP_DIR, f)) > 1000:
-            return os.path.join(TEMP_DIR, f)
+            if os.path.exists(out_tmpl) and os.path.getsize(out_tmpl) > 1000:
+                return out_tmpl
+            
+            for f in os.listdir(TEMP_DIR):
+                if f.startswith("clip_") and os.path.getsize(os.path.join(TEMP_DIR, f)) > 1000:
+                    return os.path.join(TEMP_DIR, f)
+        except Exception as e:
+            last_err = e
+            logger.warning(f"Clip format {fmt} failed: {e}")
+            continue
 
-    raise RuntimeError("Gagal memotong klip video.")
+    raise RuntimeError(f"Gagal memotong klip video: {last_err}")
 
 async def process_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_url: str):
     video_id = extract_video_id(raw_url)
@@ -330,14 +343,11 @@ CLIP_TIME: MM:SS - MM:SS
         
         result_text = response.choices[0].message.content
         
-        # Ekstrak CLIP_TIME untuk pemotongan video
         clip_match = re.search(r"CLIP_TIME:\s*(\d{2}:\d{2})\s*-\s*(\d{2}:\d{2})", result_text)
         
-        # Bersihkan tag CLIP_TIME dari jawaban tampilan Telegram
         clean_result_text = re.sub(r"\n*CLIP_TIME:.*", "", result_text).strip()
         await update.message.reply_text(clean_result_text)
 
-        # 🎬 PROSES PEMOTONGAN & PENGIRIMAN VIDEO KLIP
         if clip_match:
             start_str = clip_match.group(1)
             end_str = clip_match.group(2)
