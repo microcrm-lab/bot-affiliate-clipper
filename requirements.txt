@@ -1,6 +1,6 @@
 python-telegram-bot
 groq
-youtube-transcript-api
 Flask
 requests
 yt-dlp
+static-ffmpeg
