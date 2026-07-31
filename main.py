@@ -84,64 +84,95 @@ def parse_vtt_subtitles(vtt_text: str) -> list:
             i += 1
     return segments
 
-def get_captions_via_embed(video_id: str) -> list:
-    """Trik Embed Player Scraper: Tembus blokir YouTube via halaman embed"""
-    url = f"https://www.youtube.com/embed/{video_id}"
+def get_captions_from_web(video_id: str) -> list:
+    """Extract captions langsung dari ytInitialPlayerResponse HTML YouTube"""
+    urls = [
+        f"https://www.youtube.com/watch?v={video_id}",
+        f"https://www.youtube.com/embed/{video_id}?autoplay=1"
+    ]
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
         "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7"
     }
-    r = requests.get(url, headers=headers, timeout=10)
-    if r.status_code != 200:
-        raise RuntimeError(f"Embed HTTP {r.status_code}")
-
-    match = re.search(r'"captionTracks":\s*(\[.*?\])', r.text)
-    if not match:
-        raise RuntimeError("Caption tracks tidak ditemukan pada Embed HTML.")
-
-    caption_tracks = json.loads(match.group(1))
-    if not caption_tracks:
-        raise RuntimeError("Caption tracks kosong.")
-
-    target = next((c for c in caption_tracks if c.get("languageCode") in ["id", "ind"]), None)
-    if not target:
-        target = next((c for c in caption_tracks if c.get("languageCode") in ["en", "eng"]), caption_tracks[0])
-
-    sub_url = target.get("baseUrl")
-    if not sub_url:
-        raise RuntimeError("Subtitle URL kosong.")
-
-    if "fmt=" not in sub_url:
-        sub_url += "&fmt=vtt"
-
-    sub_req = requests.get(sub_url, headers=headers, timeout=10)
-    if sub_req.status_code == 200:
-        parsed = parse_vtt_subtitles(sub_req.text)
-        if parsed:
-            return parsed
-
-    raise RuntimeError("Gagal memuat file subtitle VTT.")
+    for url in urls:
+        try:
+            r = requests.get(url, headers=headers, timeout=10)
+            if r.status_code == 200:
+                idx = r.text.find("ytInitialPlayerResponse")
+                if idx != -1:
+                    start_idx = r.text.find("{", idx)
+                    if start_idx != -1:
+                        brace_count = 0
+                        end_idx = start_idx
+                        for i in range(start_idx, len(r.text)):
+                            if r.text[i] == '{':
+                                brace_count += 1
+                            elif r.text[i] == '}':
+                                brace_count -= 1
+                                if brace_count == 0:
+                                    end_idx = i + 1
+                                    break
+                        if end_idx > start_idx:
+                            json_str = r.text[start_idx:end_idx]
+                            data = json.loads(json_str)
+                            captions = data.get("captions", {}).get("playerCaptionsTracklistRenderer", {}).get("captionTracks", [])
+                            if captions:
+                                target = next((c for c in captions if c.get("languageCode") in ["id", "ind"]), None)
+                                if not target:
+                                    target = next((c for c in captions if c.get("languageCode") in ["en", "eng"]), captions[0])
+                                sub_url = target.get("baseUrl")
+                                if sub_url:
+                                    if "fmt=" not in sub_url:
+                                        sub_url += "&fmt=vtt"
+                                    sub_req = requests.get(sub_url, headers=headers, timeout=10)
+                                    if sub_req.status_code == 200:
+                                        parsed = parse_vtt_subtitles(sub_req.text)
+                                        if parsed:
+                                            return parsed
+        except Exception as e:
+            logger.warning(f"Gagal mengambil captions dari HTML: {e}")
+            
+    raise RuntimeError("Tidak ada subtitle bawaan pada halaman web.")
 
 def download_audio_ytdlp(video_id: str) -> str:
-    """Download audio stream via yt-dlp android player client"""
+    """Download audio menggunakan rotasi client (mweb, tv, ios) untuk Bypass Bot Detection"""
     out_path = os.path.join(TEMP_DIR, f"{uuid.uuid4().hex}.m4a")
-    ydl_opts = {
-        'format': 'm4a/bestaudio/best',
-        'outtmpl': out_path,
-        'quiet': True,
-        'no_warnings': True,
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['android', 'ios']
+    
+    clients_to_try = [
+        ['mweb'],
+        ['tv'],
+        ['ios'],
+        ['android_vr']
+    ]
+    
+    for client in clients_to_try:
+        try:
+            logger.info(f"Mencoba yt-dlp dengan client: {client}")
+            ydl_opts = {
+                'format': 'm4a/bestaudio/best',
+                'outtmpl': out_path,
+                'quiet': True,
+                'no_warnings': True,
+                'nocheckcertificate': True,
+                'extractor_args': {
+                    'youtube': {
+                        'player_client': client
+                    }
+                }
             }
-        }
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
 
-    if os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
-        return out_path
-    raise RuntimeError("yt-dlp gagal mengunduh audio.")
+            if os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
+                logger.info("Berhasil mengunduh audio via yt-dlp!")
+                return out_path
+        except Exception as e:
+            logger.warning(f"yt-dlp client {client} gagal: {e}")
+            if os.path.exists(out_path):
+                try: os.remove(out_path)
+                except Exception: pass
+                
+    raise RuntimeError("Gagal mengunduh audio (YouTube memblokir request server).")
 
 def transcribe_with_groq_whisper(audio_path: str) -> list:
     with open(audio_path, "rb") as f:
@@ -173,20 +204,20 @@ async def process_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE, ra
         await update.message.reply_text("❌ Link YouTube tidak valid!")
         return
 
-    await update.message.reply_text("⚡ [Embed Engine] Memproses teks video...")
+    await update.message.reply_text("⚡ [Web Engine] Memproses teks video...")
     audio_path = None
 
     try:
         transcript_list = None
         
-        # 1. Coba Trik Embed Scraper
+        # 1. Coba Ambil Auto-Captions via Web Parser
         try:
-            transcript_list = get_captions_via_embed(video_id)
-            logger.info("Berhasil mengambil subtitle via Embed Player Scraper!")
+            transcript_list = get_captions_from_web(video_id)
+            logger.info("Berhasil mengambil subtitle via Web Engine!")
         except Exception as e:
-            logger.info(f"Embed captions gagal/tidak ada: {e}")
+            logger.info(f"Web captions gagal/tidak ada: {e}")
 
-        # 2. Fallback: Download Audio via yt-dlp + Groq Whisper AI
+        # 2. Fallback: Download Audio (Rotasi Client mweb/tv/ios) + Groq Whisper AI
         if not transcript_list:
             await update.message.reply_text("🎙️ Video tidak punya subtitle bawaan. Mengunduh suara & memproses dengan Groq Whisper AI...")
             audio_path = download_audio_ytdlp(video_id)
@@ -245,7 +276,8 @@ Format Jawaban:
         )
     finally:
         if audio_path and os.path.exists(audio_path):
-            os.remove(audio_path)
+            try: os.remove(audio_path)
+            except Exception: pass
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
