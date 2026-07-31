@@ -135,20 +135,15 @@ def get_captions_from_web(video_id: str) -> list:
     raise RuntimeError("Tidak ada subtitle bawaan.")
 
 def download_audio_ytdlp(video_id: str) -> str:
-    """Download audio menggunakan yt-dlp + cookie pembobol blokir"""
-    out_path = os.path.join(TEMP_DIR, f"{uuid.uuid4().hex}.m4a")
+    """Download audio fleksibel menggunakan yt-dlp + cookies.txt"""
+    out_tmpl = os.path.join(TEMP_DIR, f"{uuid.uuid4().hex}.%(ext)s")
     
     ydl_opts = {
-        'format': 'm4a/bestaudio/best',
-        'outtmpl': out_path,
+        'format': 'bestaudio/best',  # Ambil format audio terbaik yang tersedia (fleksibel)
+        'outtmpl': out_tmpl,
         'quiet': True,
         'no_warnings': True,
         'nocheckcertificate': True,
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['android', 'ios', 'mweb']
-            }
-        }
     }
 
     cookie_found = False
@@ -161,16 +156,13 @@ def download_audio_ytdlp(video_id: str) -> str:
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=True)
+            downloaded_file = ydl.prepare_filename(info)
 
-        if os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
-            return out_path
+        if downloaded_file and os.path.exists(downloaded_file) and os.path.getsize(downloaded_file) > 1000:
+            return downloaded_file
     except Exception as e:
         logger.error(f"yt-dlp error: {e}")
-        if os.path.exists(out_path):
-            try: os.remove(out_path)
-            except Exception: pass
-        
         status_cookie = "Terdeteksi" if cookie_found else "TIDAK Terdeteksi di GitHub Root"
         raise RuntimeError(f"Detail yt-dlp error: `{e}` | Cookie: `{status_cookie}`")
 
@@ -273,7 +265,7 @@ Format Jawaban:
     except Exception as e:
         logger.error(f"Error: {e}")
         await update.message.reply_text(
-            f"❌ Gagal menganalisis video.\nError: {e}", 
+            f"❌ Gagal menganalisis video.\nError: `{e}`", 
             parse_mode="Markdown"
         )
     finally:
