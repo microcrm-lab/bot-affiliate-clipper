@@ -85,7 +85,7 @@ def parse_vtt_subtitles(vtt_text: str) -> list:
     return segments
 
 def get_captions_from_web(video_id: str) -> list:
-    """Extract captions langsung dari ytInitialPlayerResponse HTML YouTube"""
+    """Extract captions langsung dari HTML YouTube"""
     urls = [
         f"https://www.youtube.com/watch?v={video_id}",
         f"https://www.youtube.com/embed/{video_id}?autoplay=1"
@@ -132,47 +132,38 @@ def get_captions_from_web(video_id: str) -> list:
         except Exception as e:
             logger.warning(f"Gagal mengambil captions dari HTML: {e}")
             
-    raise RuntimeError("Tidak ada subtitle bawaan pada halaman web.")
+    raise RuntimeError("Tidak ada subtitle bawaan.")
 
 def download_audio_ytdlp(video_id: str) -> str:
-    """Download audio menggunakan rotasi client (mweb, tv, ios) untuk Bypass Bot Detection"""
+    """Download audio menggunakan yt-dlp + cookie pembobol blokir"""
     out_path = os.path.join(TEMP_DIR, f"{uuid.uuid4().hex}.m4a")
     
-    clients_to_try = [
-        ['mweb'],
-        ['tv'],
-        ['ios'],
-        ['android_vr']
-    ]
-    
-    for client in clients_to_try:
-        try:
-            logger.info(f"Mencoba yt-dlp dengan client: {client}")
-            ydl_opts = {
-                'format': 'm4a/bestaudio/best',
-                'outtmpl': out_path,
-                'quiet': True,
-                'no_warnings': True,
-                'nocheckcertificate': True,
-                'extractor_args': {
-                    'youtube': {
-                        'player_client': client
-                    }
-                }
-            }
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
+    ydl_opts = {
+        'format': 'm4a/bestaudio/best',
+        'outtmpl': out_path,
+        'quiet': True,
+        'no_warnings': True,
+        'nocheckcertificate': True,
+    }
 
-            if os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
-                logger.info("Berhasil mengunduh audio via yt-dlp!")
-                return out_path
-        except Exception as e:
-            logger.warning(f"yt-dlp client {client} gagal: {e}")
-            if os.path.exists(out_path):
-                try: os.remove(out_path)
-                except Exception: pass
-                
-    raise RuntimeError("Gagal mengunduh audio (YouTube memblokir request server).")
+    # Cek apakah file cookies.txt ada di repository
+    if os.path.exists("cookies.txt"):
+        logger.info("Menggunakan cookies.txt untuk bypass YouTube Bot Detection!")
+        ydl_opts['cookiefile'] = "cookies.txt"
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
+
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
+            return out_path
+    except Exception as e:
+        logger.error(f"yt-dlp error: {e}")
+        if os.path.exists(out_path):
+            try: os.remove(out_path)
+            except Exception: pass
+
+    raise RuntimeError("YouTube memblokir request. Pastikan file cookies.txt sudah di-upload ke GitHub!")
 
 def transcribe_with_groq_whisper(audio_path: str) -> list:
     with open(audio_path, "rb") as f:
@@ -204,20 +195,20 @@ async def process_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE, ra
         await update.message.reply_text("❌ Link YouTube tidak valid!")
         return
 
-    await update.message.reply_text("⚡ [Web Engine] Memproses teks video...")
+    await update.message.reply_text("⚡ [Cookie-Bypass Engine] Memproses teks video...")
     audio_path = None
 
     try:
         transcript_list = None
         
-        # 1. Coba Ambil Auto-Captions via Web Parser
+        # 1. Coba Subtitle Bawaan Dulu
         try:
             transcript_list = get_captions_from_web(video_id)
             logger.info("Berhasil mengambil subtitle via Web Engine!")
-        except Exception as e:
-            logger.info(f"Web captions gagal/tidak ada: {e}")
+        except Exception:
+            pass
 
-        # 2. Fallback: Download Audio (Rotasi Client mweb/tv/ios) + Groq Whisper AI
+        # 2. Fallback: Download Audio (yt-dlp + Cookies) + Groq Whisper AI
         if not transcript_list:
             await update.message.reply_text("🎙️ Video tidak punya subtitle bawaan. Mengunduh suara & memproses dengan Groq Whisper AI...")
             audio_path = download_audio_ytdlp(video_id)
