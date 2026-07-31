@@ -1,4 +1,5 @@
 python-telegram-bot
 groq
-youtube-transcript-api==0.6.2
+youtube-transcript-api
 Flask
+requests
