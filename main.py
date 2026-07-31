@@ -37,6 +37,28 @@ def fmt_time(seconds: float) -> str:
     m, s = divmod(int(seconds), 60)
     return f"{m:02d}:{s:02d}"
 
+def fetch_transcript_safe(video_id: str):
+    """Fungsi pelindung agar kompatibel dengan semua versi youtube-transcript-api"""
+    # Cara 1: Standard Class Method
+    if hasattr(YouTubeTranscriptApi, 'get_transcript'):
+        return YouTubeTranscriptApi.get_transcript(video_id, languages=['id', 'en', 'id-ID'])
+    
+    # Cara 2: Instance Method (Fallback)
+    api_instance = YouTubeTranscriptApi()
+    if hasattr(api_instance, 'get_transcript'):
+        return api_instance.get_transcript(video_id, languages=['id', 'en', 'id-ID'])
+    
+    # Cara 3: List Transcripts (Fallback 2)
+    if hasattr(YouTubeTranscriptApi, 'list_transcripts'):
+        tx_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        try:
+            tx = tx_list.find_transcript(['id', 'en', 'id-ID'])
+        except Exception:
+            tx = tx_list.find_generated_transcript(['id', 'en', 'id-ID'])
+        return tx.fetch()
+        
+    raise RuntimeError("Metode pengambil transkrip tidak ditemukan pada library.")
+
 async def process_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_url: str):
     video_id = extract_video_id(raw_url)
     if not video_id:
@@ -46,7 +68,7 @@ async def process_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE, ra
     await update.message.reply_text("⚡ [GitHub Server] Mengambil transkrip teks langsung...")
 
     try:
-        transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['id', 'en', 'id-ID'])
+        transcript_list = fetch_transcript_safe(video_id)
         
         segment_lines = []
         for item in transcript_list:
