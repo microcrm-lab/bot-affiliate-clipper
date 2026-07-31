@@ -144,12 +144,20 @@ def download_audio_ytdlp(video_id: str) -> str:
         'quiet': True,
         'no_warnings': True,
         'nocheckcertificate': True,
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'ios', 'mweb']
+            }
+        }
     }
 
-    # Cek apakah file cookies.txt ada di repository
-    if os.path.exists("cookies.txt"):
-        logger.info("Menggunakan cookies.txt untuk bypass YouTube Bot Detection!")
-        ydl_opts['cookiefile'] = "cookies.txt"
+    cookie_found = False
+    for candidate in ["cookies.txt", "cookies.txt.txt", "youtube_cookies.txt"]:
+        if os.path.exists(candidate):
+            logger.info(f"Menggunakan {candidate} untuk bypass YouTube Bot Detection!")
+            ydl_opts['cookiefile'] = candidate
+            cookie_found = True
+            break
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -162,8 +170,11 @@ def download_audio_ytdlp(video_id: str) -> str:
         if os.path.exists(out_path):
             try: os.remove(out_path)
             except Exception: pass
+        
+        status_cookie = "Terdeteksi" if cookie_found else "TIDAK Terdeteksi di GitHub Root"
+        raise RuntimeError(f"Detail yt-dlp error: `{e}` | Cookie: `{status_cookie}`")
 
-    raise RuntimeError("YouTube memblokir request. Pastikan file cookies.txt sudah di-upload ke GitHub!")
+    raise RuntimeError("File audio tidak berhasil dibuat.")
 
 def transcribe_with_groq_whisper(audio_path: str) -> list:
     with open(audio_path, "rb") as f:
@@ -262,7 +273,7 @@ Format Jawaban:
     except Exception as e:
         logger.error(f"Error: {e}")
         await update.message.reply_text(
-            f"❌ Gagal menganalisis video.\nError: `{e}`", 
+            f"❌ Gagal menganalisis video.\nError: {e}", 
             parse_mode="Markdown"
         )
     finally:
