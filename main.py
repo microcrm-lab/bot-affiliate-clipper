@@ -6,6 +6,10 @@ import threading
 import logging
 import requests
 import yt_dlp
+import static_ffmpeg
+
+# Pasang FFmpeg otomatis ke sistem
+static_ffmpeg.add_paths()
 
 from flask import Flask
 from groq import Groq
@@ -102,10 +106,6 @@ def parse_json3_subtitles(json_data: dict) -> list:
     return segments
 
 def extract_yt_data_and_captions(video_id: str) -> tuple[list | None, str | None]:
-    """
-    Gunakan format='all' agar yt-dlp TIDAK MEMILIK FILTER ALASAN 'Requested format is not available'.
-    Ekstrak auto-caption langsung dari info_dict yt-dlp.
-    """
     cookie_candidate = None
     for candidate in ["cookies.txt", "cookies.txt.txt", "youtube_cookies.txt"]:
         if os.path.exists(candidate):
@@ -116,7 +116,7 @@ def extract_yt_data_and_captions(video_id: str) -> tuple[list | None, str | None
         'quiet': True,
         'no_warnings': True,
         'nocheckcertificate': True,
-        'format': 'all',  # KUNCI UTAMA: Mematikan filter pembawa error
+        'format': 'all',
     }
     if cookie_candidate:
         ydl_opts['cookiefile'] = cookie_candidate
@@ -128,7 +128,6 @@ def extract_yt_data_and_captions(video_id: str) -> tuple[list | None, str | None
     if not info:
         raise RuntimeError("Gagal mengekstrak informasi video dari YouTube.")
 
-    # 1. PERIKSA SUBTITLE/AUTO-CAPTIONS LANGSUNG DARI YT-DLP METADATA
     subtitles_dict = info.get('subtitles') or {}
     auto_captions_dict = info.get('automatic_captions') or {}
 
@@ -169,7 +168,6 @@ def extract_yt_data_and_captions(video_id: str) -> tuple[list | None, str | None
                         if parsed:
                             return parsed, None
 
-    # 2. JIKA CAPTION TIDAK ADA -> AMBIL LINK DIRECT AUDIO STREAM
     formats = info.get('formats', [])
     selected_fmt = next(
         (f for f in formats if f.get('vcodec') == 'none' and f.get('acodec') != 'none' and f.get('url')),
@@ -200,7 +198,7 @@ def extract_yt_data_and_captions(video_id: str) -> tuple[list | None, str | None
             if os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
                 return None, out_path
 
-    raise RuntimeError("Sistem tidak menemukan subtitle maupun link audio pada video ini.")
+    raise RuntimeError("Sistem tidak menemukan subtitle maupun link audio.")
 
 def transcribe_with_groq_whisper(media_path: str) -> list:
     with open(media_path, "rb") as f:
@@ -226,6 +224,45 @@ def transcribe_with_groq_whisper(media_path: str) -> list:
             })
     return segments
 
+def download_video_clip(video_id: str, start_str: str, end_str: str) -> str:
+    """Memotong bagian video klip sesuai timestamp menggunakan FFmpeg & yt-dlp"""
+    out_tmpl = os.path.join(TEMP_DIR, f"clip_{uuid.uuid4().hex}.mp4")
+    
+    cookie_candidate = None
+    for candidate in ["cookies.txt", "cookies.txt.txt", "youtube_cookies.txt"]:
+        if os.path.exists(candidate):
+            cookie_candidate = candidate
+            break
+
+    # Format timestamp ke format hh:mm:ss/mm:ss untuk yt-dlp
+    download_section = f"*{start_str}-{end_str}"
+
+    ydl_opts = {
+        'format': 'b/best', # Ambil MP4 pre-merged
+        'outtmpl': out_tmpl,
+        'quiet': True,
+        'no_warnings': True,
+        'nocheckcertificate': True,
+        'download_ranges': yt_dlp.utils.download_range_func(None, [(parse_vtt_timestamp(start_str), parse_vtt_timestamp(end_str))]),
+        'force_keyframes_at_cuts': True,
+    }
+
+    if cookie_candidate:
+        ydl_opts['cookiefile'] = cookie_candidate
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
+
+    if os.path.exists(out_tmpl) and os.path.getsize(out_tmpl) > 1000:
+        return out_tmpl
+    
+    # Fallback pencarian file MP4 jika nama file terasosiasi ekstensi lain
+    for f in os.listdir(TEMP_DIR):
+        if f.startswith("clip_") and os.path.getsize(os.path.join(TEMP_DIR, f)) > 1000:
+            return os.path.join(TEMP_DIR, f)
+
+    raise RuntimeError("Gagal memotong klip video.")
+
 async def process_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_url: str):
     video_id = extract_video_id(raw_url)
     if not video_id:
@@ -234,6 +271,7 @@ async def process_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE, ra
 
     await update.message.reply_text("⚡ [Cookie Engine] Memproses data YouTube...")
     media_path = None
+    clip_path = None
 
     try:
         transcript_list, media_path = extract_yt_data_and_captions(video_id)
@@ -260,10 +298,14 @@ async def process_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE, ra
 
 ---
 Tugasmu:
-1. Pilih 1 momen paling viral/hook terkuat (durasi 30-60 detik).
-2. Tuliskan Timestamp (MM:SS - MM:SS).
+1. Pilih 1 momen paling viral/hook terkuat (durasi 15-60 detik).
+2. Tuliskan Timestamp persis dengan format MM:SS - MM:SS.
 3. Tuliskan kutipan transkripnya.
 4. Buatkan 1 Teks CTA TikTok Affiliate yang bagus.
+
+SANGAT PENTING:
+Sertakan baris ini persis di paling bawah jawabanmu:
+CLIP_TIME: MM:SS - MM:SS
 
 Format Jawaban:
 ⏱️ Timestamp: MM:SS - MM:SS
@@ -272,6 +314,8 @@ Format Jawaban:
 
 🛒 CTA TikTok:
 [teks CTA]
+
+CLIP_TIME: MM:SS - MM:SS
 """
         await update.message.reply_text("🧠 Menganalisis momen viral dengan Groq LLaMA...")
         
@@ -285,7 +329,30 @@ Format Jawaban:
         )
         
         result_text = response.choices[0].message.content
-        await update.message.reply_text(result_text)
+        
+        # Ekstrak CLIP_TIME untuk pemotongan video
+        clip_match = re.search(r"CLIP_TIME:\s*(\d{2}:\d{2})\s*-\s*(\d{2}:\d{2})", result_text)
+        
+        # Bersihkan tag CLIP_TIME dari jawaban tampilan Telegram
+        clean_result_text = re.sub(r"\n*CLIP_TIME:.*", "", result_text).strip()
+        await update.message.reply_text(clean_result_text)
+
+        # 🎬 PROSES PEMOTONGAN & PENGIRIMAN VIDEO KLIP
+        if clip_match:
+            start_str = clip_match.group(1)
+            end_str = clip_match.group(2)
+            
+            await update.message.reply_text(f"✂️ Memotong klip video MP4 [{start_str} - {end_str}]...")
+            try:
+                clip_path = download_video_clip(video_id, start_str, end_str)
+                with open(clip_path, "rb") as video_file:
+                    await update.message.reply_video(
+                        video=video_file,
+                        caption=f"🎬 Klip Momen Viral [{start_str} - {end_str}]\nSiap diposting ke TikTok!"
+                    )
+            except Exception as clip_err:
+                logger.error(f"Gagal memotong klip: {clip_err}")
+                await update.message.reply_text(f"⚠️ Teks analisis berhasil, tapi gagal memotong klip video: `{clip_err}`", parse_mode="Markdown")
 
     except Exception as e:
         logger.error(f"Error: {e}")
@@ -296,6 +363,9 @@ Format Jawaban:
     finally:
         if media_path and os.path.exists(media_path):
             try: os.remove(media_path)
+            except Exception: pass
+        if clip_path and os.path.exists(clip_path):
+            try: os.remove(clip_path)
             except Exception: pass
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
