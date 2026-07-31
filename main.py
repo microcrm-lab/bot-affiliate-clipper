@@ -135,11 +135,11 @@ def get_captions_from_web(video_id: str) -> list:
     raise RuntimeError("Tidak ada subtitle bawaan.")
 
 def download_audio_ytdlp(video_id: str) -> str:
-    """Download audio fleksibel menggunakan yt-dlp + cookies.txt"""
+    """Download MP4 video langsung (tanpa perlu FFmpeg) via yt-dlp + cookies.txt"""
     out_tmpl = os.path.join(TEMP_DIR, f"{uuid.uuid4().hex}.%(ext)s")
     
     ydl_opts = {
-        'format': 'bestaudio/best',  # Ambil format audio terbaik yang tersedia (fleksibel)
+        'format': 'b/best',  # Mengambil file gabungan biasa (MP4) tanpa ribet
         'outtmpl': out_tmpl,
         'quiet': True,
         'no_warnings': True,
@@ -166,12 +166,13 @@ def download_audio_ytdlp(video_id: str) -> str:
         status_cookie = "Terdeteksi" if cookie_found else "TIDAK Terdeteksi di GitHub Root"
         raise RuntimeError(f"Detail yt-dlp error: `{e}` | Cookie: `{status_cookie}`")
 
-    raise RuntimeError("File audio tidak berhasil dibuat.")
+    raise RuntimeError("File video tidak berhasil dibuat.")
 
-def transcribe_with_groq_whisper(audio_path: str) -> list:
-    with open(audio_path, "rb") as f:
+def transcribe_with_groq_whisper(media_path: str) -> list:
+    """Groq Whisper AI bisa membaca file MP4 secara langsung!"""
+    with open(media_path, "rb") as f:
         response = groq_client.audio.transcriptions.create(
-            file=(os.path.basename(audio_path), f),
+            file=(os.path.basename(media_path), f),
             model=WHISPER_MODEL,
             response_format="verbose_json",
             language="id",
@@ -199,7 +200,7 @@ async def process_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE, ra
         return
 
     await update.message.reply_text("⚡ [Cookie-Bypass Engine] Memproses teks video...")
-    audio_path = None
+    media_path = None
 
     try:
         transcript_list = None
@@ -211,11 +212,11 @@ async def process_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE, ra
         except Exception:
             pass
 
-        # 2. Fallback: Download Audio (yt-dlp + Cookies) + Groq Whisper AI
+        # 2. Fallback: Download Direct MP4 (yt-dlp + Cookies) + Groq Whisper AI
         if not transcript_list:
-            await update.message.reply_text("🎙️ Video tidak punya subtitle bawaan. Mengunduh suara & memproses dengan Groq Whisper AI...")
-            audio_path = download_audio_ytdlp(video_id)
-            transcript_list = transcribe_with_groq_whisper(audio_path)
+            await update.message.reply_text("🎙️ Video tidak punya subtitle bawaan. Mengunduh media & memproses suara dengan Groq Whisper AI...")
+            media_path = download_audio_ytdlp(video_id)
+            transcript_list = transcribe_with_groq_whisper(media_path)
 
         if not transcript_list:
             await update.message.reply_text("⚠️ Gagal mengekstrak kata-kata dari video ini.")
@@ -269,8 +270,8 @@ Format Jawaban:
             parse_mode="Markdown"
         )
     finally:
-        if audio_path and os.path.exists(audio_path):
-            try: os.remove(audio_path)
+        if media_path and os.path.exists(media_path):
+            try: os.remove(media_path)
             except Exception: pass
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
