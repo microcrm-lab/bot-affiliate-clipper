@@ -4,8 +4,8 @@ import json
 import uuid
 import threading
 import logging
-import requests
 import subprocess
+import requests
 import yt_dlp
 import static_ffmpeg
 
@@ -25,7 +25,7 @@ GROQ_API_KEY   = os.environ["GROQ_API_KEY"]
 
 GROQ_MODEL    = "llama-3.1-8b-instant"
 WHISPER_MODEL = "whisper-large-v3"
-TEMP_DIR      = "/tmp/yt_audio"
+TEMP_DIR      = "/tmp/yt_bot"
 
 os.makedirs(TEMP_DIR, exist_ok=True)
 groq_client = Groq(api_key=GROQ_API_KEY)
@@ -49,7 +49,7 @@ def fmt_time(seconds: float) -> str:
     m, s = divmod(int(seconds), 60)
     return f"{m:02d}:{s:02d}"
 
-def parse_vtt_timestamp(ts_str: str) -> float:
+def parse_timestamp(ts_str: str) -> float:
     parts = ts_str.strip().split(':')
     if len(parts) == 3:
         h, m, s = parts
@@ -59,154 +59,76 @@ def parse_vtt_timestamp(ts_str: str) -> float:
         return int(m)*60 + float(s.replace(',', '.'))
     return 0.0
 
-def parse_vtt_subtitles(vtt_text: str) -> list:
-    lines = vtt_text.splitlines()
-    segments = []
-    i = 0
-    while i < len(lines):
-        line = lines[i].strip()
-        if '-->' in line:
-            times = line.split('-->')
-            start = parse_vtt_timestamp(times[0])
-            end = parse_vtt_timestamp(times[1].split()[0])
-            
-            i += 1
-            text_lines = []
-            while i < len(lines) and lines[i].strip() and '-->' not in lines[i]:
-                clean_line = re.sub(r'<[^>]+>', '', lines[i].strip())
-                if clean_line:
-                    text_lines.append(clean_line)
-                i += 1
-            
-            text = " ".join(text_lines)
-            if text:
-                segments.append({
-                    'start': start,
-                    'duration': max(0.5, end - start),
-                    'text': text
-                })
-        else:
-            i += 1
-    return segments
-
-def parse_json3_subtitles(json_data: dict) -> list:
-    segments = []
-    events = json_data.get("events", [])
-    for ev in events:
-        start_ms = ev.get("tStartMs", 0)
-        dur_ms = ev.get("dDurationMs", 1000)
-        segs = ev.get("segs", [])
-        text = "".join([s.get("utf8", "") for s in segs if s.get("utf8")]).strip()
-        text = re.sub(r'\s+', ' ', text)
-        if text and text != "\n":
-            segments.append({
-                'start': start_ms / 1000.0,
-                'duration': max(0.5, dur_ms / 1000.0),
-                'text': text
-            })
-    return segments
-
-def extract_yt_data_and_captions(video_id: str) -> tuple[list | None, str | None]:
-    cookie_candidate = None
+def get_cookie_file() -> str | None:
     for candidate in ["cookies.txt", "cookies.txt.txt", "youtube_cookies.txt"]:
         if os.path.exists(candidate):
-            cookie_candidate = candidate
-            break
+            return candidate
+    return None
 
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'nocheckcertificate': True,
-        'format': 'all',
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['android', 'ios', 'mweb']
+def download_full_video(video_id: str) -> str:
+    """Download video lengkap ke lokal disk agar siap dipotong offline oleh FFmpeg"""
+    file_prefix = os.path.join(TEMP_DIR, f"full_{uuid.uuid4().hex}")
+    out_tmpl = f"{file_prefix}.%(ext)s"
+    cookie_file = get_cookie_file()
+
+    client_strategies = [
+        ['android', 'ios', 'mweb'],
+        ['tv', 'mweb'],
+        ['ios']
+    ]
+
+    last_error = None
+    for client in client_strategies:
+        ydl_opts = {
+            'outtmpl': out_tmpl,
+            'quiet': True,
+            'no_warnings': True,
+            'nocheckcertificate': True,
+            'extractor_args': {
+                'youtube': {
+                    'player_client': client
+                }
             }
         }
-    }
-    if cookie_candidate:
-        ydl_opts['cookiefile'] = cookie_candidate
+        if cookie_file:
+            ydl_opts['cookiefile'] = cookie_file
 
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=True)
+                downloaded_file = ydl.prepare_filename(info)
 
-    if not info:
-        raise RuntimeError("Gagal mengekstrak informasi video dari YouTube.")
+            if os.path.exists(downloaded_file) and os.path.getsize(downloaded_file) > 1000:
+                return downloaded_file
+        except Exception as e:
+            last_error = e
+            logger.warning(f"Download video dengan client {client} gagal: {e}")
+            continue
 
-    subtitles_dict = info.get('subtitles') or {}
-    auto_captions_dict = info.get('automatic_captions') or {}
+    # Fallback standar
+    try:
+        ydl_opts_basic = {
+            'outtmpl': out_tmpl,
+            'quiet': True,
+            'no_warnings': True,
+            'nocheckcertificate': True,
+        }
+        if cookie_file:
+            ydl_opts_basic['cookiefile'] = cookie_file
 
-    all_caps = {}
-    all_caps.update(auto_captions_dict)
-    all_caps.update(subtitles_dict)
+        with yt_dlp.YoutubeDL(ydl_opts_basic) as ydl:
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=True)
+            downloaded_file = ydl.prepare_filename(info)
 
-    if all_caps:
-        target_lang = None
-        for lang_code in ['id', 'ind', 'id-ID', 'en', 'en-US']:
-            if lang_code in all_caps:
-                target_lang = lang_code
-                break
-        
-        if not target_lang:
-            target_lang = list(all_caps.keys())[0]
+        if os.path.exists(downloaded_file) and os.path.getsize(downloaded_file) > 1000:
+            return downloaded_file
+    except Exception as e:
+        last_error = e
 
-        track_list = all_caps.get(target_lang, [])
-        vtt_track = next((t for t in track_list if t.get('ext') == 'vtt'), None)
-        json3_track = next((t for t in track_list if t.get('ext') in ['json3', 'json']), None)
-        chosen_track = vtt_track or json3_track or (track_list[0] if track_list else None)
-
-        if chosen_track and chosen_track.get('url'):
-            sub_url = chosen_track['url']
-            resp = requests.get(sub_url, timeout=10)
-            if resp.status_code == 200:
-                if chosen_track.get('ext') == 'vtt' or 'fmt=vtt' in sub_url:
-                    parsed = parse_vtt_subtitles(resp.text)
-                    if parsed:
-                        return parsed, None
-                else:
-                    try:
-                        parsed = parse_json3_subtitles(resp.json())
-                        if parsed:
-                            return parsed, None
-                    except Exception:
-                        parsed = parse_vtt_subtitles(resp.text)
-                        if parsed:
-                            return parsed, None
-
-    formats = info.get('formats', [])
-    selected_fmt = next(
-        (f for f in formats if f.get('vcodec') == 'none' and f.get('acodec') != 'none' and f.get('url')),
-        None
-    )
-    if not selected_fmt:
-        selected_fmt = next(
-            (f for f in formats if f.get('acodec') != 'none' and f.get('url')),
-            None
-        )
-    if not selected_fmt and formats:
-        selected_fmt = formats[0]
-
-    if selected_fmt and selected_fmt.get('url'):
-        stream_url = selected_fmt['url']
-        ext = selected_fmt.get('ext', 'm4a')
-        headers = selected_fmt.get('http_headers', {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
-        })
-        
-        out_path = os.path.join(TEMP_DIR, f"{uuid.uuid4().hex}.{ext}")
-        r = requests.get(stream_url, headers=headers, stream=True, timeout=60)
-        if r.status_code == 200:
-            with open(out_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=1024*1024):
-                    if chunk:
-                        f.write(chunk)
-            if os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
-                return None, out_path
-
-    raise RuntimeError("Sistem tidak menemukan subtitle maupun link audio.")
+    raise RuntimeError(f"Gagal mengunduh video dari YouTube. Detail: `{last_error}`")
 
 def transcribe_with_groq_whisper(media_path: str) -> list:
+    """Groq Whisper AI menerima file MP4 lokal secara langsung"""
     with open(media_path, "rb") as f:
         response = groq_client.audio.transcriptions.create(
             file=(os.path.basename(media_path), f),
@@ -230,102 +152,49 @@ def transcribe_with_groq_whisper(media_path: str) -> list:
             })
     return segments
 
-def download_video_clip(video_id: str, start_str: str, end_str: str) -> str:
-    """Memotong klip MP4 dengan rotasi player_client + Direct FFmpeg Fallback"""
-    out_tmpl = os.path.join(TEMP_DIR, f"clip_{uuid.uuid4().hex}.mp4")
-    
-    cookie_candidate = None
-    for candidate in ["cookies.txt", "cookies.txt.txt", "youtube_cookies.txt"]:
-        if os.path.exists(candidate):
-            cookie_candidate = candidate
-            break
-
-    start_sec = parse_vtt_timestamp(start_str)
-    end_sec = parse_vtt_timestamp(end_str)
+def cut_video_locally(input_video_path: str, start_str: str, end_str: str) -> str:
+    """Potong video secara OFFLINE menggunakan FFmpeg dari file lokal (100% cepat & bebas error)"""
+    start_sec = parse_timestamp(start_str)
+    end_sec = parse_timestamp(end_str)
 
     if end_sec <= start_sec:
         end_sec = start_sec + 15
 
-    clients_to_try = [
-        ['android', 'ios', 'mweb'],
-        ['tv', 'mweb'],
-        ['ios']
+    duration = end_sec - start_sec
+    output_clip_path = os.path.join(TEMP_DIR, f"clip_{uuid.uuid4().hex}.mp4")
+
+    # Fast Stream Copy
+    cmd = [
+        'ffmpeg', '-y',
+        '-ss', str(start_sec),
+        '-i', input_video_path,
+        '-t', str(duration),
+        '-c', 'copy',
+        output_clip_path
     ]
 
-    last_err = None
+    logger.info(f"Menjalankan FFmpeg pemotong lokal...")
+    subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-    # STRATEGI 1: yt-dlp dengan Client Spoofing Presisi
-    for client in clients_to_try:
-        ydl_opts = {
-            'outtmpl': out_tmpl,
-            'quiet': True,
-            'no_warnings': True,
-            'nocheckcertificate': True,
-            'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best',
-            'download_ranges': yt_dlp.utils.download_range_func(None, [(start_sec, end_sec)]),
-            'force_keyframes_at_cuts': True,
-            'extractor_args': {
-                'youtube': {
-                    'player_client': client
-                }
-            }
-        }
-        if cookie_candidate:
-            ydl_opts['cookiefile'] = cookie_candidate
+    if os.path.exists(output_clip_path) and os.path.getsize(output_clip_path) > 1000:
+        return output_clip_path
 
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
+    # Fallback re-encode jika stream copy gagal
+    cmd_reencode = [
+        'ffmpeg', '-y',
+        '-ss', str(start_sec),
+        '-i', input_video_path,
+        '-t', str(duration),
+        '-c:v', 'libx264', '-c:a', 'aac',
+        '-preset', 'ultrafast',
+        output_clip_path
+    ]
+    subprocess.run(cmd_reencode, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-            if os.path.exists(out_tmpl) and os.path.getsize(out_tmpl) > 1000:
-                return out_tmpl
-            
-            for f in os.listdir(TEMP_DIR):
-                fp = os.path.join(TEMP_DIR, f)
-                if f.startswith("clip_") and os.path.getsize(fp) > 1000:
-                    return fp
-        except Exception as e:
-            last_err = e
-            logger.warning(f"Clip client {client} failed: {e}")
-            continue
+    if os.path.exists(output_clip_path) and os.path.getsize(output_clip_path) > 1000:
+        return output_clip_path
 
-    # STRATEGI 2: Direct FFmpeg CLI Stream Cutting (Fallback Anti-Gagal)
-    try:
-        logger.info("Menjalankan Direct FFmpeg Stream Cutter...")
-        ydl_opts_info = {
-            'quiet': True,
-            'no_warnings': True,
-            'nocheckcertificate': True,
-            'format': 'all',
-            'extractor_args': {'youtube': {'player_client': ['android', 'ios', 'mweb']}}
-        }
-        if cookie_candidate:
-            ydl_opts_info['cookiefile'] = cookie_candidate
-
-        with yt_dlp.YoutubeDL(ydl_opts_info) as ydl:
-            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
-        
-        formats = info.get('formats', [])
-        v_fmt = next((f for f in formats if f.get('vcodec') != 'none' and f.get('url')), None)
-        
-        if v_fmt and v_fmt.get('url'):
-            stream_url = v_fmt['url']
-            cmd = [
-                'ffmpeg', '-y',
-                '-ss', str(start_sec),
-                '-to', str(end_sec),
-                '-i', stream_url,
-                '-c', 'copy',
-                out_tmpl
-            ]
-            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
-
-            if os.path.exists(out_tmpl) and os.path.getsize(out_tmpl) > 1000:
-                return out_tmpl
-    except Exception as ffmpeg_err:
-        logger.warning(f"FFmpeg direct stream clip failed: {ffmpeg_err}")
-
-    raise RuntimeError(f"{last_err}")
+    raise RuntimeError("FFmpeg gagal memotong video lokal.")
 
 async def process_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_url: str):
     video_id = extract_video_id(raw_url)
@@ -333,16 +202,17 @@ async def process_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE, ra
         await update.message.reply_text("❌ Link YouTube tidak valid!")
         return
 
-    await update.message.reply_text("⚡ [Cookie Engine] Memproses data YouTube...")
-    media_path = None
+    status_msg = await update.message.reply_text("⚡ [Local Engine] Mengunduh video YouTube...")
+    raw_video_path = None
     clip_path = None
 
     try:
-        transcript_list, media_path = extract_yt_data_and_captions(video_id)
+        # 1. Download Video Utuh ke Server
+        raw_video_path = download_full_video(video_id)
 
-        if not transcript_list and media_path:
-            await update.message.reply_text("🎙️ Subtitle tidak tersedia. Memproses audio dengan Groq Whisper AI...")
-            transcript_list = transcribe_with_groq_whisper(media_path)
+        # 2. Transkripkan via Groq Whisper AI
+        await status_msg.edit_text("🎙️ Memproses transkripsi suara dengan Groq Whisper AI...")
+        transcript_list = transcribe_with_groq_whisper(raw_video_path)
 
         if not transcript_list:
             await update.message.reply_text("⚠️ Gagal mengekstrak kata-kata dari video ini.")
@@ -381,7 +251,7 @@ Format Jawaban:
 
 CLIP_TIME: MM:SS - MM:SS
 """
-        await update.message.reply_text("🧠 Menganalisis momen viral dengan Groq LLaMA...")
+        await status_msg.edit_text("🧠 Menganalisis momen viral dengan Groq LLaMA...")
         
         response = groq_client.chat.completions.create(
             model=GROQ_MODEL,
@@ -395,17 +265,18 @@ CLIP_TIME: MM:SS - MM:SS
         result_text = response.choices[0].message.content
         
         clip_match = re.search(r"CLIP_TIME:\s*(\d{2}:\d{2})\s*-\s*(\d{2}:\d{2})", result_text)
-        
         clean_result_text = re.sub(r"\n*CLIP_TIME:.*", "", result_text).strip()
+
         await update.message.reply_text(clean_result_text)
 
+        # 3. Potong Klip Secara OFFLINE & Kirim File MP4
         if clip_match:
             start_str = clip_match.group(1)
             end_str = clip_match.group(2)
             
-            await update.message.reply_text(f"✂️ Memotong klip video MP4 [{start_str} - {end_str}]...")
+            await update.message.reply_text(f"✂️ Memotong klip video MP4 [{start_str} - {end_str}] secara offline...")
             try:
-                clip_path = download_video_clip(video_id, start_str, end_str)
+                clip_path = cut_video_locally(raw_video_path, start_str, end_str)
                 with open(clip_path, "rb") as video_file:
                     await update.message.reply_video(
                         video=video_file,
@@ -422,8 +293,9 @@ CLIP_TIME: MM:SS - MM:SS
             parse_mode="Markdown"
         )
     finally:
-        if media_path and os.path.exists(media_path):
-            try: os.remove(media_path)
+        # Bersihkan file dari memori server
+        if raw_video_path and os.path.exists(raw_video_path):
+            try: os.remove(raw_video_path)
             except Exception: pass
         if clip_path and os.path.exists(clip_path):
             try: os.remove(clip_path)
