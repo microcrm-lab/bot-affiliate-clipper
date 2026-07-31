@@ -84,58 +84,28 @@ def parse_vtt_subtitles(vtt_text: str) -> list:
             i += 1
     return segments
 
-def get_captions_from_web(video_id: str) -> list:
-    """Extract captions langsung dari HTML YouTube"""
-    urls = [
-        f"https://www.youtube.com/watch?v={video_id}",
-        f"https://www.youtube.com/embed/{video_id}?autoplay=1"
-    ]
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-        "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7"
-    }
-    for url in urls:
-        try:
-            r = requests.get(url, headers=headers, timeout=10)
-            if r.status_code == 200:
-                idx = r.text.find("ytInitialPlayerResponse")
-                if idx != -1:
-                    start_idx = r.text.find("{", idx)
-                    if start_idx != -1:
-                        brace_count = 0
-                        end_idx = start_idx
-                        for i in range(start_idx, len(r.text)):
-                            if r.text[i] == '{':
-                                brace_count += 1
-                            elif r.text[i] == '}':
-                                brace_count -= 1
-                                if brace_count == 0:
-                                    end_idx = i + 1
-                                    break
-                        if end_idx > start_idx:
-                            json_str = r.text[start_idx:end_idx]
-                            data = json.loads(json_str)
-                            captions = data.get("captions", {}).get("playerCaptionsTracklistRenderer", {}).get("captionTracks", [])
-                            if captions:
-                                target = next((c for c in captions if c.get("languageCode") in ["id", "ind"]), None)
-                                if not target:
-                                    target = next((c for c in captions if c.get("languageCode") in ["en", "eng"]), captions[0])
-                                sub_url = target.get("baseUrl")
-                                if sub_url:
-                                    if "fmt=" not in sub_url:
-                                        sub_url += "&fmt=vtt"
-                                    sub_req = requests.get(sub_url, headers=headers, timeout=10)
-                                    if sub_req.status_code == 200:
-                                        parsed = parse_vtt_subtitles(sub_req.text)
-                                        if parsed:
-                                            return parsed
-        except Exception as e:
-            logger.warning(f"Gagal mengambil captions dari HTML: {e}")
-            
-    raise RuntimeError("Tidak ada subtitle bawaan.")
+def parse_json3_subtitles(json_data: dict) -> list:
+    segments = []
+    events = json_data.get("events", [])
+    for ev in events:
+        start_ms = ev.get("tStartMs", 0)
+        dur_ms = ev.get("dDurationMs", 1000)
+        segs = ev.get("segs", [])
+        text = "".join([s.get("utf8", "") for s in segs if s.get("utf8")]).strip()
+        text = re.sub(r'\s+', ' ', text)
+        if text and text != "\n":
+            segments.append({
+                'start': start_ms / 1000.0,
+                'duration': max(0.5, dur_ms / 1000.0),
+                'text': text
+            })
+    return segments
 
-def download_direct_stream(video_id: str) -> str:
-    """Gunakan yt-dlp HANYA untuk extract URL direct stream, lalu download via requests (Bypass FFmpeg)"""
+def extract_yt_data_and_captions(video_id: str) -> tuple[list | None, str | None]:
+    """
+    Gunakan format='all' agar yt-dlp TIDAK MEMILIK FILTER ALASAN 'Requested format is not available'.
+    Ekstrak auto-caption langsung dari info_dict yt-dlp.
+    """
     cookie_candidate = None
     for candidate in ["cookies.txt", "cookies.txt.txt", "youtube_cookies.txt"]:
         if os.path.exists(candidate):
@@ -146,58 +116,93 @@ def download_direct_stream(video_id: str) -> str:
         'quiet': True,
         'no_warnings': True,
         'nocheckcertificate': True,
+        'format': 'all',  # KUNCI UTAMA: Mematikan filter pembawa error
     }
     if cookie_candidate:
         ydl_opts['cookiefile'] = cookie_candidate
 
-    logger.info(f"Mengekstrak direct URL untuk video {video_id}...")
+    url = f"https://www.youtube.com/watch?v={video_id}"
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        # download=False agar tidak memakai FFmpeg/Downloader yt-dlp internal
-        info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+        info = ydl.extract_info(url, download=False)
 
+    if not info:
+        raise RuntimeError("Gagal mengekstrak informasi video dari YouTube.")
+
+    # 1. PERIKSA SUBTITLE/AUTO-CAPTIONS LANGSUNG DARI YT-DLP METADATA
+    subtitles_dict = info.get('subtitles') or {}
+    auto_captions_dict = info.get('automatic_captions') or {}
+
+    all_caps = {}
+    all_caps.update(auto_captions_dict)
+    all_caps.update(subtitles_dict)
+
+    if all_caps:
+        target_lang = None
+        for lang_code in ['id', 'ind', 'id-ID', 'en', 'en-US']:
+            if lang_code in all_caps:
+                target_lang = lang_code
+                break
+        
+        if not target_lang:
+            target_lang = list(all_caps.keys())[0]
+
+        track_list = all_caps.get(target_lang, [])
+        vtt_track = next((t for t in track_list if t.get('ext') == 'vtt'), None)
+        json3_track = next((t for t in track_list if t.get('ext') in ['json3', 'json']), None)
+        chosen_track = vtt_track or json3_track or (track_list[0] if track_list else None)
+
+        if chosen_track and chosen_track.get('url'):
+            sub_url = chosen_track['url']
+            resp = requests.get(sub_url, timeout=10)
+            if resp.status_code == 200:
+                if chosen_track.get('ext') == 'vtt' or 'fmt=vtt' in sub_url:
+                    parsed = parse_vtt_subtitles(resp.text)
+                    if parsed:
+                        return parsed, None
+                else:
+                    try:
+                        parsed = parse_json3_subtitles(resp.json())
+                        if parsed:
+                            return parsed, None
+                    except Exception:
+                        parsed = parse_vtt_subtitles(resp.text)
+                        if parsed:
+                            return parsed, None
+
+    # 2. JIKA CAPTION TIDAK ADA -> AMBIL LINK DIRECT AUDIO STREAM
     formats = info.get('formats', [])
-    if not formats:
-        raise RuntimeError("Stream format tidak ditemukan.")
-
-    # Cari audio murni
-    selected_format = next(
+    selected_fmt = next(
         (f for f in formats if f.get('vcodec') == 'none' and f.get('acodec') != 'none' and f.get('url')),
         None
     )
-
-    # Fallback: Cari format video+audio biasa jika audio murni tidak ada
-    if not selected_format:
-        selected_format = next(
+    if not selected_fmt:
+        selected_fmt = next(
             (f for f in formats if f.get('acodec') != 'none' and f.get('url')),
             None
         )
+    if not selected_fmt and formats:
+        selected_fmt = formats[0]
 
-    if not selected_format or not selected_format.get('url'):
-        raise RuntimeError("Gagal mendapatkan link direct stream audio.")
+    if selected_fmt and selected_fmt.get('url'):
+        stream_url = selected_fmt['url']
+        ext = selected_fmt.get('ext', 'm4a')
+        headers = selected_fmt.get('http_headers', {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+        })
+        
+        out_path = os.path.join(TEMP_DIR, f"{uuid.uuid4().hex}.{ext}")
+        r = requests.get(stream_url, headers=headers, stream=True, timeout=60)
+        if r.status_code == 200:
+            with open(out_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024*1024):
+                    if chunk:
+                        f.write(chunk)
+            if os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
+                return None, out_path
 
-    stream_url = selected_format['url']
-    ext = selected_format.get('ext', 'm4a')
-    http_headers = selected_format.get('http_headers', {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-    })
-
-    out_path = os.path.join(TEMP_DIR, f"{uuid.uuid4().hex}.{ext}")
-    logger.info(f"Mengunduh stream audio via Requests ke {out_path}...")
-
-    resp = requests.get(stream_url, headers=http_headers, stream=True, timeout=60)
-    if resp.status_code == 200:
-        with open(out_path, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    f.write(chunk)
-        if os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
-            logger.info("Direct stream download sukses!")
-            return out_path
-
-    raise RuntimeError(f"Gagal mengunduh audio dari server YouTube (HTTP {resp.status_code}).")
+    raise RuntimeError("Sistem tidak menemukan subtitle maupun link audio pada video ini.")
 
 def transcribe_with_groq_whisper(media_path: str) -> list:
-    """Groq Whisper AI membaca file M4A/WebM/MP4 secara presisi!"""
     with open(media_path, "rb") as f:
         response = groq_client.audio.transcriptions.create(
             file=(os.path.basename(media_path), f),
@@ -227,23 +232,14 @@ async def process_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE, ra
         await update.message.reply_text("❌ Link YouTube tidak valid!")
         return
 
-    await update.message.reply_text("⚡ [Cookie-Bypass Engine] Memproses teks video...")
+    await update.message.reply_text("⚡ [Cookie Engine] Memproses data YouTube...")
     media_path = None
 
     try:
-        transcript_list = None
-        
-        # 1. Coba Subtitle Bawaan Dulu
-        try:
-            transcript_list = get_captions_from_web(video_id)
-            logger.info("Berhasil mengambil subtitle via Web Engine!")
-        except Exception:
-            pass
+        transcript_list, media_path = extract_yt_data_and_captions(video_id)
 
-        # 2. Fallback: Direct Stream Download + Groq Whisper AI
-        if not transcript_list:
-            await update.message.reply_text("🎙️ Video tidak punya subtitle bawaan. Mengunduh stream audio & memproses dengan Groq Whisper AI...")
-            media_path = download_direct_stream(video_id)
+        if not transcript_list and media_path:
+            await update.message.reply_text("🎙️ Subtitle tidak tersedia. Memproses audio dengan Groq Whisper AI...")
             transcript_list = transcribe_with_groq_whisper(media_path)
 
         if not transcript_list:
