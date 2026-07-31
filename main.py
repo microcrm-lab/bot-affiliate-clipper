@@ -134,42 +134,55 @@ def get_captions_from_web(video_id: str) -> list:
             
     raise RuntimeError("Tidak ada subtitle bawaan.")
 
-def download_audio_ytdlp(video_id: str) -> str:
-    """Download MP4 video langsung (tanpa perlu FFmpeg) via yt-dlp + cookies.txt"""
+def download_media_ytdlp(video_id: str) -> str:
+    """Download media dengan 5 Layer Format Fallback anti-fail"""
     out_tmpl = os.path.join(TEMP_DIR, f"{uuid.uuid4().hex}.%(ext)s")
     
-    ydl_opts = {
-        'format': 'b/best',  # Mengambil file gabungan biasa (MP4) tanpa ribet
-        'outtmpl': out_tmpl,
-        'quiet': True,
-        'no_warnings': True,
-        'nocheckcertificate': True,
-    }
+    # Daftar strategi format yang dicoba bertahap dari paling ringan sampai paling umum
+    format_strategies = [
+        '140/251/249/250/139', # Direct format ID audio YouTube paling umum
+        'ba/ba*',              # Best Audio
+        '18/worst[ext=mp4]',   # Format 18 (MP4 360p pre-merged)
+        'b/b*',                # Any pre-merged video/audio
+        None                   # Standard yt-dlp auto-selection
+    ]
 
-    cookie_found = False
+    cookie_candidate = None
     for candidate in ["cookies.txt", "cookies.txt.txt", "youtube_cookies.txt"]:
         if os.path.exists(candidate):
-            logger.info(f"Menggunakan {candidate} untuk bypass YouTube Bot Detection!")
-            ydl_opts['cookiefile'] = candidate
-            cookie_found = True
+            cookie_candidate = candidate
             break
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=True)
-            downloaded_file = ydl.prepare_filename(info)
+    last_error = None
+    for fmt in format_strategies:
+        ydl_opts = {
+            'outtmpl': out_tmpl,
+            'quiet': True,
+            'no_warnings': True,
+            'nocheckcertificate': True,
+        }
+        if fmt:
+            ydl_opts['format'] = fmt
+        if cookie_candidate:
+            ydl_opts['cookiefile'] = cookie_candidate
 
-        if downloaded_file and os.path.exists(downloaded_file) and os.path.getsize(downloaded_file) > 1000:
-            return downloaded_file
-    except Exception as e:
-        logger.error(f"yt-dlp error: {e}")
-        status_cookie = "Terdeteksi" if cookie_found else "TIDAK Terdeteksi di GitHub Root"
-        raise RuntimeError(f"Detail yt-dlp error: `{e}` | Cookie: `{status_cookie}`")
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=True)
+                downloaded_file = ydl.prepare_filename(info)
 
-    raise RuntimeError("File video tidak berhasil dibuat.")
+            if downloaded_file and os.path.exists(downloaded_file) and os.path.getsize(downloaded_file) > 1000:
+                logger.info(f"Berhasil mengunduh media dengan strategi format '{fmt}'!")
+                return downloaded_file
+        except Exception as e:
+            last_error = e
+            logger.warning(f"Strategi format '{fmt}' gagal: {e}")
+            continue
+
+    status_cookie = "Terdeteksi" if cookie_candidate else "TIDAK Terdeteksi di GitHub Root"
+    raise RuntimeError(f"Detail error: `{last_error}` | Cookie: `{status_cookie}`")
 
 def transcribe_with_groq_whisper(media_path: str) -> list:
-    """Groq Whisper AI bisa membaca file MP4 secara langsung!"""
     with open(media_path, "rb") as f:
         response = groq_client.audio.transcriptions.create(
             file=(os.path.basename(media_path), f),
@@ -212,10 +225,10 @@ async def process_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE, ra
         except Exception:
             pass
 
-        # 2. Fallback: Download Direct MP4 (yt-dlp + Cookies) + Groq Whisper AI
+        # 2. Fallback: Download Media (Multi-Format Loop + Cookies) + Groq Whisper AI
         if not transcript_list:
             await update.message.reply_text("🎙️ Video tidak punya subtitle bawaan. Mengunduh media & memproses suara dengan Groq Whisper AI...")
-            media_path = download_audio_ytdlp(video_id)
+            media_path = download_media_ytdlp(video_id)
             transcript_list = transcribe_with_groq_whisper(media_path)
 
         if not transcript_list:
