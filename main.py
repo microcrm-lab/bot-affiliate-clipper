@@ -5,7 +5,6 @@ import threading
 import logging
 import requests
 
-from youtube_transcript_api import YouTubeTranscriptApi
 from flask import Flask
 from groq import Groq
 from telegram import Update
@@ -83,98 +82,96 @@ def parse_vtt_subtitles(vtt_text: str) -> list:
             i += 1
     return segments
 
-def get_transcript_proxy(video_id: str) -> list:
-    proxy_instances = [
+def get_captions_from_invidious(video_id: str) -> list:
+    """Mengambil Auto-Generated Captions via Invidious Instances"""
+    instances = [
+        "https://inv.us.projectsegfau.lt",
+        "https://invidious.nerdvpn.de",
+        "https://invidious.drgns.space",
+        "https://inv.tux.pizza"
+    ]
+
+    for instance in instances:
+        try:
+            url = f"{instance}/api/v1/captions/{video_id}"
+            r = requests.get(url, timeout=6)
+            if r.status_code == 200:
+                captions = r.json().get("captions", [])
+                if captions:
+                    # Priority: Indonesian -> English -> First Available
+                    target = next((c for c in captions if c.get("languageCode") in ["id", "ind"]), None)
+                    if not target:
+                        target = next((c for c in captions if c.get("languageCode") in ["en", "eng"]), captions[0])
+                    
+                    sub_url = target.get("url")
+                    if sub_url:
+                        full_sub_url = f"{instance}{sub_url}" if sub_url.startswith("/") else sub_url
+                        vtt_req = requests.get(full_sub_url, timeout=6)
+                        if vtt_req.status_code == 200:
+                            parsed = parse_vtt_subtitles(vtt_req.text)
+                            if parsed:
+                                logger.info(f"Berhasil ambil subtitle via Invidious ({instance})")
+                                return parsed
+        except Exception as e:
+            logger.warning(f"Invidious caption failed ({instance}): {e}")
+    raise RuntimeError("Invidious no captions")
+
+def get_captions_from_piped(video_id: str) -> list:
+    """Mengambil Subtitle/Auto-CC via Piped API"""
+    instances = [
         "https://api.piped.yt",
         "https://pipedapi.adminforge.de",
         "https://api.piped.privacydev.net",
         "https://pipedapi.kavin.rocks"
     ]
 
-    for instance in proxy_instances:
+    for instance in instances:
         try:
             url = f"{instance}/streams/{video_id}"
             r = requests.get(url, timeout=6)
             if r.status_code == 200:
                 subtitles = r.json().get("subtitles", [])
-                if not subtitles:
-                    continue
-                
-                target_sub = next((s for s in subtitles if s.get("code","").lower() in ["id","ind","id-id"]), subtitles[0])
-                sub_url = target_sub.get("url")
-                if sub_url:
-                    sub_req = requests.get(sub_url, timeout=6)
-                    if sub_req.status_code == 200:
-                        parsed = parse_vtt_subtitles(sub_req.text)
-                        if parsed:
-                            return parsed
+                if subtitles:
+                    target = next((s for s in subtitles if s.get("code","").lower() in ["id","ind","id-id"]), subtitles[0])
+                    sub_url = target.get("url")
+                    if sub_url:
+                        sub_req = requests.get(sub_url, timeout=6)
+                        if sub_req.status_code == 200:
+                            parsed = parse_vtt_subtitles(sub_req.text)
+                            if parsed:
+                                logger.info(f"Berhasil ambil subtitle via Piped ({instance})")
+                                return parsed
+        except Exception as e:
+            logger.warning(f"Piped caption failed ({instance}): {e}")
+    raise RuntimeError("Piped no captions")
+
+def download_audio_cobalt_fallback(raw_url: str) -> str:
+    """Download audio menggunakan Cobalt Public Endpoints"""
+    instances = [
+        "https://api.cobalt.tools",
+        "https://cobalt-api.kwippy.com",
+        "https://co.wuk.sh"
+    ]
+    payload = {"url": raw_url, "isAudioOnly": True}
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+
+    for instance in instances:
+        try:
+            r = requests.post(f"{instance}/", json=payload, headers=headers, timeout=10)
+            if r.status_code == 200:
+                audio_url = r.json().get("url")
+                if audio_url:
+                    out_path = os.path.join(TEMP_DIR, f"{uuid.uuid4().hex}.mp3")
+                    audio_req = requests.get(audio_url, stream=True, timeout=30)
+                    if audio_req.status_code == 200:
+                        with open(out_path, "wb") as f:
+                            for chunk in audio_req.iter_content(chunk_size=1024*1024):
+                                f.write(chunk)
+                        if os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
+                            return out_path
         except Exception:
             pass
-    raise RuntimeError("No CC found on proxy")
-
-def download_audio_proxy_stream(video_id: str) -> str:
-    """Download audio stream m4a/webm langsung dari Piped & Invidious Proxy."""
-    
-    # 1. Piped API Stream Audio
-    piped_instances = [
-        "https://api.piped.yt",
-        "https://pipedapi.adminforge.de",
-        "https://api.piped.privacydev.net",
-        "https://pipedapi.kavin.rocks"
-    ]
-
-    for instance in piped_instances:
-        try:
-            logger.info(f"Mencoba stream audio dari Piped: {instance}")
-            url = f"{instance}/streams/{video_id}"
-            r = requests.get(url, timeout=8)
-            if r.status_code == 200:
-                audio_streams = r.json().get("audioStreams", [])
-                if audio_streams:
-                    stream_url = audio_streams[0].get("url")
-                    if stream_url:
-                        out_path = os.path.join(TEMP_DIR, f"{uuid.uuid4().hex}.m4a")
-                        audio_req = requests.get(stream_url, stream=True, timeout=60)
-                        if audio_req.status_code == 200:
-                            with open(out_path, "wb") as f:
-                                for chunk in audio_req.iter_content(chunk_size=1024*1024):
-                                    f.write(chunk)
-                            if os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
-                                logger.info("Berhasil mengunduh audio stream!")
-                                return out_path
-        except Exception as e:
-            logger.warning(f"Gagal audio Piped {instance}: {e}")
-
-    # 2. Invidious API Adaptive Audio Formats
-    invidious_instances = [
-        "https://invidious.nerdvpn.de",
-        "https://inv.us.projectsegfau.lt",
-        "https://invidious.drgns.space"
-    ]
-
-    for instance in invidious_instances:
-        try:
-            logger.info(f"Mencoba stream audio dari Invidious: {instance}")
-            url = f"{instance}/api/v1/videos/{video_id}"
-            r = requests.get(url, timeout=8)
-            if r.status_code == 200:
-                adaptive_formats = r.json().get("adaptiveFormats", [])
-                for fmt in adaptive_formats:
-                    if "audio" in fmt.get("type", ""):
-                        stream_url = fmt.get("url")
-                        if stream_url:
-                            out_path = os.path.join(TEMP_DIR, f"{uuid.uuid4().hex}.m4a")
-                            audio_req = requests.get(stream_url, stream=True, timeout=60)
-                            if audio_req.status_code == 200:
-                                with open(out_path, "wb") as f:
-                                    for chunk in audio_req.iter_content(chunk_size=1024*1024):
-                                        f.write(chunk)
-                                if os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
-                                    return out_path
-        except Exception as e:
-            logger.warning(f"Gagal audio Invidious {instance}: {e}")
-
-    raise RuntimeError("Gagal mengambil file audio dari proxy.")
+    raise RuntimeError("Gagal mengambil audio dari server.")
 
 def transcribe_with_groq_whisper(audio_path: str) -> list:
     with open(audio_path, "rb") as f:
@@ -206,18 +203,29 @@ async def process_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE, ra
         await update.message.reply_text("❌ Link YouTube tidak valid!")
         return
 
-    await update.message.reply_text("⚡ [Hybrid AI System] Memproses transkrip...")
+    await update.message.reply_text("⚡ [Ultra-Bypass System] Memproses teks video...")
     audio_path = None
 
     try:
-        # 1. Coba Subtitle Bawaan
+        transcript_list = None
+        
+        # 1. Coba ambil Auto-Caption via Invidious Proxy
         try:
-            transcript_list = get_transcript_proxy(video_id)
-            logger.info("Transkrip dari Subtitle Bawaan berhasil!")
+            transcript_list = get_captions_from_invidious(video_id)
         except Exception:
-            # 2. Fallback: Download Audio Stream & Groq Whisper AI
-            await update.message.reply_text("🎙️ Video tidak punya subtitle bawaan. Memproses suara dengan Groq Whisper AI...")
-            audio_path = download_audio_proxy_stream(video_id)
+            pass
+
+        # 2. Coba ambil Subtitle via Piped Proxy
+        if not transcript_list:
+            try:
+                transcript_list = get_captions_from_piped(video_id)
+            except Exception:
+                pass
+
+        # 3. Fallback ke Groq Whisper AI jika tidak ada caption sama sekali
+        if not transcript_list:
+            await update.message.reply_text("🎙️ Mengunduh suara & memproses dengan Groq Whisper AI...")
+            audio_path = download_audio_cobalt_fallback(f"https://www.youtube.com/watch?v={video_id}")
             transcript_list = transcribe_with_groq_whisper(audio_path)
 
         if not transcript_list:
