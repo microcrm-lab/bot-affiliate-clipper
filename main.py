@@ -5,6 +5,7 @@ import uuid
 import threading
 import logging
 import requests
+import subprocess
 import yt_dlp
 import static_ffmpeg
 
@@ -117,6 +118,11 @@ def extract_yt_data_and_captions(video_id: str) -> tuple[list | None, str | None
         'no_warnings': True,
         'nocheckcertificate': True,
         'format': 'all',
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'ios', 'mweb']
+            }
+        }
     }
     if cookie_candidate:
         ydl_opts['cookiefile'] = cookie_candidate
@@ -225,7 +231,7 @@ def transcribe_with_groq_whisper(media_path: str) -> list:
     return segments
 
 def download_video_clip(video_id: str, start_str: str, end_str: str) -> str:
-    """Memotong bagian video klip sesuai timestamp menggunakan FFmpeg & yt-dlp multi-fallback"""
+    """Memotong klip MP4 dengan rotasi player_client + Direct FFmpeg Fallback"""
     out_tmpl = os.path.join(TEMP_DIR, f"clip_{uuid.uuid4().hex}.mp4")
     
     cookie_candidate = None
@@ -237,25 +243,33 @@ def download_video_clip(video_id: str, start_str: str, end_str: str) -> str:
     start_sec = parse_vtt_timestamp(start_str)
     end_sec = parse_vtt_timestamp(end_str)
 
-    # Format multi-stream fleksibel (Bypass error Requested format is not available)
-    format_options = [
-        'bv*+ba*/b/best', # Gabung video + audio via FFmpeg
-        'b/best',         # Fallback pre-merged
-        None              # Auto default yt-dlp
+    if end_sec <= start_sec:
+        end_sec = start_sec + 15
+
+    clients_to_try = [
+        ['android', 'ios', 'mweb'],
+        ['tv', 'mweb'],
+        ['ios']
     ]
 
     last_err = None
-    for fmt in format_options:
+
+    # STRATEGI 1: yt-dlp dengan Client Spoofing Presisi
+    for client in clients_to_try:
         ydl_opts = {
             'outtmpl': out_tmpl,
             'quiet': True,
             'no_warnings': True,
             'nocheckcertificate': True,
+            'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best',
             'download_ranges': yt_dlp.utils.download_range_func(None, [(start_sec, end_sec)]),
             'force_keyframes_at_cuts': True,
+            'extractor_args': {
+                'youtube': {
+                    'player_client': client
+                }
+            }
         }
-        if fmt:
-            ydl_opts['format'] = fmt
         if cookie_candidate:
             ydl_opts['cookiefile'] = cookie_candidate
 
@@ -267,14 +281,51 @@ def download_video_clip(video_id: str, start_str: str, end_str: str) -> str:
                 return out_tmpl
             
             for f in os.listdir(TEMP_DIR):
-                if f.startswith("clip_") and os.path.getsize(os.path.join(TEMP_DIR, f)) > 1000:
-                    return os.path.join(TEMP_DIR, f)
+                fp = os.path.join(TEMP_DIR, f)
+                if f.startswith("clip_") and os.path.getsize(fp) > 1000:
+                    return fp
         except Exception as e:
             last_err = e
-            logger.warning(f"Clip format {fmt} failed: {e}")
+            logger.warning(f"Clip client {client} failed: {e}")
             continue
 
-    raise RuntimeError(f"Gagal memotong klip video: {last_err}")
+    # STRATEGI 2: Direct FFmpeg CLI Stream Cutting (Fallback Anti-Gagal)
+    try:
+        logger.info("Menjalankan Direct FFmpeg Stream Cutter...")
+        ydl_opts_info = {
+            'quiet': True,
+            'no_warnings': True,
+            'nocheckcertificate': True,
+            'format': 'all',
+            'extractor_args': {'youtube': {'player_client': ['android', 'ios', 'mweb']}}
+        }
+        if cookie_candidate:
+            ydl_opts_info['cookiefile'] = cookie_candidate
+
+        with yt_dlp.YoutubeDL(ydl_opts_info) as ydl:
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+        
+        formats = info.get('formats', [])
+        v_fmt = next((f for f in formats if f.get('vcodec') != 'none' and f.get('url')), None)
+        
+        if v_fmt and v_fmt.get('url'):
+            stream_url = v_fmt['url']
+            cmd = [
+                'ffmpeg', '-y',
+                '-ss', str(start_sec),
+                '-to', str(end_sec),
+                '-i', stream_url,
+                '-c', 'copy',
+                out_tmpl
+            ]
+            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+
+            if os.path.exists(out_tmpl) and os.path.getsize(out_tmpl) > 1000:
+                return out_tmpl
+    except Exception as ffmpeg_err:
+        logger.warning(f"FFmpeg direct stream clip failed: {ffmpeg_err}")
+
+    raise RuntimeError(f"{last_err}")
 
 async def process_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_url: str):
     video_id = extract_video_id(raw_url)
