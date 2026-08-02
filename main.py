@@ -116,7 +116,7 @@ class KeepAliveServer:
 # ==================== YOUTUBE DOWNLOADER ====================
 class YouTubeDownloader:
     """
-    YouTube Downloader dengan Bypasser IP Datacenter via Cookies & TV Embedded Client
+    YouTube Downloader dengan Validasi Cookie & Android/iOS Mobile Client
     """
 
     @staticmethod
@@ -125,10 +125,9 @@ class YouTubeDownloader:
             "outtmpl": str(Path(output_dir) / f"{file_prefix}_%(id)s.%(ext)s"),
             "merge_output_format": "mp4",
             "ffmpeg_location": Config.FFMPEG_PATH,
-            # Player client paling kebal blokir datacenter
             "extractor_args": {
                 "youtube": {
-                    "player_client": ["tv_embedded", "ios", "android"]
+                    "player_client": ["android", "ios"]
                 }
             },
             "quiet": True,
@@ -139,11 +138,19 @@ class YouTubeDownloader:
             "retries": 10,
         }
 
-        # Cek dan muat cookies jika ada di root directory
+        # Cek dan muat cookies jika ada
         cookie_file = Path(Config.COOKIES_PATH)
         if cookie_file.exists():
-            logger.info(f"🍪 Menggunakan cookies dari: {cookie_file}")
-            opts["cookiefile"] = str(cookie_file)
+            # Verifikasi sederhana apakah file cookie tidak terpotong
+            try:
+                content = cookie_file.read_text(encoding="utf-8", errors="ignore")
+                if "youtube.com" in content or "google.com" in content:
+                    logger.info(f"🍪 Cookie YouTube valid terdeteksi: {cookie_file}")
+                    opts["cookiefile"] = str(cookie_file)
+                else:
+                    logger.warning("⚠️ File cookies.txt terdeteksi KORUPSI/TERPOTONG! yt-dlp tidak memuatnya.")
+            except Exception as e:
+                logger.warning(f"⚠️ Gagal membaca cookies.txt: {e}")
         else:
             logger.warning("⚠️ File cookies.txt tidak ditemukan di root directory!")
 
@@ -217,7 +224,7 @@ class YouTubeDownloader:
                 last_error = e
                 await asyncio.sleep(1)
 
-        raise RuntimeError(f"Gagal mendownload video YouTube (IP Render Diblokir). Pastikan file cookies.txt sudah diupload ke GitHub. Error: {last_error}")
+        raise RuntimeError(f"Gagal mendownload video YouTube. Pastikan file cookies.txt di GitHub sudah diperbaiki. Error: {last_error}")
 
     @staticmethod
     async def _convert_to_mp4(input_path: Path) -> Path:
