@@ -96,19 +96,19 @@ class YouTubeDownloader:
     async def download_video(url: str, output_dir: Path) -> Optional[Dict]:
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        # 4 Lapis Fallback Format
         format_strategies = [
-            'b/best',                                       # Opsi 1: MP4/WebM tergabung (Paling aman untuk Shorts)
-            'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best',   # Opsi 2: Standar kualitas tinggi
-            'bv*+ba*',                                      # Opsi 3: Kualitas mentah
-            'all'                                           # Opsi 4: Paksa ambil apa saja dari YouTube
+            'b/best',
+            'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best',
+            'bv*+ba*',
+            'all'
         ]
         
         last_error = None
         
         for fmt in format_strategies:
+            file_prefix = f'vid_{uuid.uuid4().hex}'
             ydl_opts = {
-                'outtmpl': str(Path(output_dir) / f'vid_{uuid.uuid4().hex}_%(id)s.%(ext)s'),
+                'outtmpl': str(Path(output_dir) / f'{file_prefix}_%(id)s.%(ext)s'),
                 'extractor_args': {
                     'youtube': {
                         'player_client': ['android', 'ios', 'mweb']
@@ -128,9 +128,13 @@ class YouTubeDownloader:
                     logger.info(f"📥 Mencoba download dengan format '{fmt}'...")
                     info = ydl.extract_info(url, download=True)
                     
-                    video_files = list(output_dir.glob("vid_*.mp4")) or list(output_dir.glob("vid_*.*"))
+                    # Filter HANYA file video jadi (abaikan file temp .part / .ytdl)
+                    valid_extensions = ('.mp4', '.mkv', '.webm', '.m4v')
+                    all_files = list(output_dir.glob(f"{file_prefix}_*.*"))
+                    video_files = [f for f in all_files if f.suffix.lower() in valid_extensions and not f.name.endswith('.part')]
+                    
                     if not video_files:
-                        raise FileNotFoundError("Video terdownload tapi file tidak ditemukan di disk.")
+                        raise FileNotFoundError("Video terdownload tapi file utuh tidak ditemukan di disk.")
                     
                     video_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
                     video_path = video_files[0]
@@ -142,7 +146,7 @@ class YouTubeDownloader:
                         'video_id': info.get('id', ''),
                     }
                     
-                    logger.info(f"✅ Sukses download dengan format: {fmt}")
+                    logger.info(f"✅ Sukses download: {video_path.name}")
                     return metadata
                     
             except Exception as e:
@@ -150,7 +154,8 @@ class YouTubeDownloader:
                 last_error = e
                 continue
                 
-        raise RuntimeError(f"Gagal memproses format video dari YouTube. Error detail: {last_error}")
+        raise RuntimeError(f"Gagal memproses video dari YouTube: {last_error}")
+
 
 # ==================== AI PROCESSOR ====================
 class AIProcessor:
