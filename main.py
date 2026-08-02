@@ -120,88 +120,68 @@ class YouTubeDownloader:
   async def download_video(url: str, output_dir: Path) -> Optional[Dict]:
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Format strategi yang WAJIB mengandung trek suara (acodec!=none)
-    format_strategies = [
-        "best[ext=mp4][acodec!=none]/best[acodec!=none]/b",  # Format tunggal yang sudah ada suaranya
-        (
-            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio"
-        ),  # Gabungkan video+audio via ffmpeg
-        "b/best",  # Fallback standar
-    ]
+    file_prefix = f"vid_{uuid.uuid4().hex}"
+    ydl_opts = {
+        "outtmpl": str(Path(output_dir) / f"{file_prefix}_%(id)s.%(ext)s"),
+        "format": "bv*+ba/b",  # Ambil best video + best audio apa saja, fallback ke pre-merged
+        "merge_output_format": (
+            "mp4"  # Paksa FFmpeg gabungkan ke MP4 jika video & audio terpisah
+        ),
+        "ffmpeg_location": Config.FFMPEG_PATH,
+        "extractor_args": {
+            "youtube": {"player_client": ["android", "ios", "mweb"]}
+        },
+        "quiet": True,
+        "no_warnings": True,
+        "nocheckcertificate": True,
+    }
 
-    last_error = None
+    if os.path.exists(Config.COOKIES_PATH):
+      ydl_opts["cookiefile"] = Config.COOKIES_PATH
 
-    for fmt in format_strategies:
-      file_prefix = f"vid_{uuid.uuid4().hex}"
-      ydl_opts = {
-          "outtmpl": str(Path(output_dir) / f"{file_prefix}_%(id)s.%(ext)s"),
-          "ffmpeg_location": Config.FFMPEG_PATH,
-          "extractor_args": {
-              "youtube": {"player_client": ["android", "ios", "mweb"]}
-          },
-          "format": fmt,
-          "quiet": True,
-          "no_warnings": True,
-          "nocheckcertificate": True,
-      }
+    try:
+      with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        logger.info(f"📥 Memulai download video...")
+        info = ydl.extract_info(url, download=True)
 
-      if os.path.exists(Config.COOKIES_PATH):
-        ydl_opts["cookiefile"] = Config.COOKIES_PATH
+        # Cari file hasil download yang valid
+        candidate_files = [
+            f
+            for f in output_dir.glob(f"{file_prefix}_*.*")
+            if not f.name.endswith(".part")
+            and not f.name.endswith(".ytdl")
+            and f.stat().st_size > 1000
+        ]
 
-      try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-          logger.info(f"📥 Mencoba download dengan format '{fmt}'...")
-          info = ydl.extract_info(url, download=True)
+        if not candidate_files:
+          candidate_files = [
+              f
+              for f in output_dir.glob("*.*")
+              if f.suffix.lower() in (".mp4", ".mkv", ".webm", ".m4v")
+              and not f.name.endswith(".part")
+              and not f.name.endswith(".ytdl")
+              and f.stat().st_size > 1000
+          ]
 
-          expected_path = Path(ydl.prepare_filename(info))
-          target_path = None
+        if not candidate_files:
+          raise FileNotFoundError("Video terdownload tapi file tidak ditemukan.")
 
-          if expected_path.exists() and expected_path.stat().st_size > 1000:
-            target_path = expected_path
-          else:
-            for ext in [".mp4", ".mkv", ".webm", ".m4v"]:
-              alt_path = expected_path.with_suffix(ext)
-              if alt_path.exists() and alt_path.stat().st_size > 1000:
-                target_path = alt_path
-                break
+        candidate_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+        target_path = candidate_files[0]
 
-          if not target_path:
-            valid_exts = (".mp4", ".mkv", ".webm", ".m4v", ".mov")
-            candidate_files = [
-                f
-                for f in output_dir.glob("*.*")
-                if f.suffix.lower() in valid_exts
-                and not f.name.endswith(".part")
-                and not f.name.endswith(".ytdl")
-                and f.stat().st_size > 1000
-            ]
-            if candidate_files:
-              candidate_files.sort(
-                  key=lambda x: x.stat().st_mtime, reverse=True
-              )
-              target_path = candidate_files[0]
+        metadata = {
+            "video_path": target_path,
+            "title": info.get("title", "Unknown Title"),
+            "duration": info.get("duration", 0),
+            "video_id": info.get("id", ""),
+        }
 
-          if not target_path:
-            raise FileNotFoundError(
-                "yt-dlp selesai tetapi file video utuh tidak ditemukan di disk."
-            )
+        logger.info(f"✅ Sukses download: {target_path.name}")
+        return metadata
 
-          metadata = {
-              "video_path": target_path,
-              "title": info.get("title", "Unknown Title"),
-              "duration": info.get("duration", 0),
-              "video_id": info.get("id", ""),
-          }
-
-          logger.info(f"✅ Sukses download: {target_path.name}")
-          return metadata
-
-      except Exception as e:
-        logger.warning(f"Format '{fmt}' ditolak: {e}")
-        last_error = e
-        continue
-
-    raise RuntimeError(f"Gagal memproses video dari YouTube: {last_error}")
+    except Exception as e:
+      logger.error(f"Download failed: {e}")
+      raise RuntimeError(f"Gagal memproses video dari YouTube: {e}")
 
 
 # ==================== AI PROCESSOR ====================
