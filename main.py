@@ -117,7 +117,7 @@ class KeepAliveServer:
 # ==================== YOUTUBE DOWNLOADER ====================
 class YouTubeDownloader:
     """
-    YouTube Downloader dengan Rotasi Player Client & Path Cookies Presisi
+    YouTube Downloader dengan Bypasser Datacenter IP menggunakan Android VR & TV Client
     """
 
     @staticmethod
@@ -146,19 +146,20 @@ class YouTubeDownloader:
         output_dir.mkdir(parents=True, exist_ok=True)
         file_prefix = f"vid_{uuid.uuid4().hex}"
 
-        # Rotasi player_client & format strategy
+        # Strategi Bypass Menggunakan Client VR & TV (Bypass IP Block Render)
         strategies = [
-            {"client": ["mweb"], "fmt": "b/best"},
-            {"client": ["android"], "fmt": "bv*+ba/b"},
-            {"client": ["ios"], "fmt": "best"},
-            {"client": ["web"], "fmt": None},
+            {"clients": ["android_vr"], "fmt": "best/b"},
+            {"clients": ["tv"], "fmt": "best"},
+            {"clients": ["android_vr", "tv"], "fmt": "bv*+ba*/b"},
+            {"clients": ["ios", "android"], "fmt": "b"},
+            {"clients": ["mweb", "web"], "fmt": None},
         ]
 
         last_error = None
 
         for attempt, strat in enumerate(strategies, 1):
             try:
-                logger.info(f"🔄 Mencoba strategi #{attempt} (Client: {strat['client']}, Format: {strat['fmt'] or 'default'})...")
+                logger.info(f"🔄 Mencoba strategi #{attempt} (Client: {strat['clients']}, Format: {strat['fmt'] or 'default'})...")
                 
                 ydl_opts = {
                     "outtmpl": str(Path(output_dir) / f"{file_prefix}_%(id)s.%(ext)s"),
@@ -166,7 +167,7 @@ class YouTubeDownloader:
                     "ffmpeg_location": Config.FFMPEG_PATH,
                     "extractor_args": {
                         "youtube": {
-                            "player_client": strat["client"]
+                            "player_client": strat["clients"]
                         }
                     },
                     "quiet": True,
@@ -185,8 +186,6 @@ class YouTubeDownloader:
                 if cookie_file.exists():
                     logger.info(f"🍪 Menggunakan cookies dari: {cookie_file}")
                     ydl_opts["cookiefile"] = str(cookie_file)
-                else:
-                    logger.warning(f"⚠️ File cookies tidak ditemukan di: {cookie_file}")
 
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(url, download=True)
@@ -567,66 +566,66 @@ class YouTubeClipperBot:
                 "🔗 Silakan kirimkan link YouTube yang valid."
             )
 
-    async def process_video(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, url: str
-    ):
-        user_id = update.effective_user.id
+  async def process_video(
+      self, update: Update, context: ContextTypes.DEFAULT_TYPE, url: str
+  ):
+    user_id = update.effective_user.id
 
-        if user_id in self.sessions:
-            self.sessions[user_id].cleanup()
+    if user_id in self.sessions:
+      self.sessions[user_id].cleanup()
 
-        session = UserSession(user_id)
-        self.sessions[user_id] = session
+    session = UserSession(user_id)
+    self.sessions[user_id] = session
 
-        status_msg = await update.message.reply_text(
-            "🎬 *Memproses video...*", parse_mode=ParseMode.MARKDOWN
-        )
+    status_msg = await update.message.reply_text(
+        "🎬 *Memproses video...*", parse_mode=ParseMode.MARKDOWN
+    )
 
-        try:
-            # 1. Download
-            await self._update_status(
-                status_msg, "📥 Mendownload video dari YouTube...", 10
-            )
-            downloader = YouTubeDownloader()
-            metadata = await downloader.download_video(url, session.temp_dir)
-            session.video_path = metadata["video_path"]
+    try:
+      # 1. Download
+      await self._update_status(
+          status_msg, "📥 Mendownload video dari YouTube...", 10
+      )
+      downloader = YouTubeDownloader()
+      metadata = await downloader.download_video(url, session.temp_dir)
+      session.video_path = metadata["video_path"]
 
-            # 2. Transcribe
-            await self._update_status(
-                status_msg, "🎤 Mentranskripsi audio dengan Groq Whisper...", 35
-            )
-            transcription = await self.ai_processor.transcribe_video(
-                session.video_path
-            )
-            session.transcription = transcription
+      # 2. Transcribe
+      await self._update_status(
+          status_msg, "🎤 Mentranskripsi audio dengan Groq Whisper...", 35
+      )
+      transcription = await self.ai_processor.transcribe_video(
+          session.video_path
+      )
+      session.transcription = transcription
 
-            # 3. Analyze Hook
-            await self._update_status(
-                status_msg, "🧠 Menganalisis hook viral dengan LLaMA AI...", 65
-            )
-            hook_analysis = await self.ai_processor.find_viral_hook(
-                transcription, metadata["duration"]
-            )
-            session.hook_analysis = hook_analysis
+      # 3. Analyze Hook
+      await self._update_status(
+          status_msg, "🧠 Menganalisis hook viral dengan LLaMA AI...", 65
+      )
+      hook_analysis = await self.ai_processor.find_viral_hook(
+          transcription, metadata["duration"]
+      )
+      session.hook_analysis = hook_analysis
 
-            # 4. Clip Video
-            await self._update_status(
-                status_msg, "✂️ Memotong klip video 9:16...", 85
-            )
-            clipper = VideoClipper()
-            clip_path = session.temp_dir / f"clip_{user_id}.mp4"
-            session.clip_path = await clipper.clip_video(
-                session.video_path,
-                clip_path,
-                hook_analysis["start_seconds"],
-                hook_analysis["end_seconds"],
-            )
+      # 4. Clip Video
+      await self._update_status(
+          status_msg, "✂️ Memotong klip video 9:16...", 85
+      )
+      clipper = VideoClipper()
+      clip_path = session.temp_dir / f"clip_{user_id}.mp4"
+      session.clip_path = await clipper.clip_video(
+          session.video_path,
+          clip_path,
+          hook_analysis["start_seconds"],
+          hook_analysis["end_seconds"],
+      )
 
-            await self._update_status(status_msg, "📤 Mengirimkan hasil...", 95)
-            smart_title = await self.ai_processor.generate_smart_title(hook_analysis)
+      await self._update_status(status_msg, "📤 Mengirimkan hasil...", 95)
+      smart_title = await self.ai_processor.generate_smart_title(hook_analysis)
 
-            # Format Response
-            response_text = f"""
+      # Format Response
+      response_text = f"""
 🎬 *HASIL ANALISIS AI HOOK FINDER*
 
 🏷️ *Judul Viral:* {smart_title}
@@ -646,46 +645,46 @@ _{hook_analysis['clip_transcript'][:300]}_
 
 ✨ _Klip video vertical (9:16) siap diupload ke TikTok/Shorts!_
 """
-            # Send Video with Caption
-            with open(session.clip_path, "rb") as video_file:
-                await update.message.reply_video(
-                    video=video_file,
-                    caption=response_text,
-                    parse_mode=ParseMode.MARKDOWN,
-                    supports_streaming=True,
-                )
+      # Send Video with Caption
+      with open(session.clip_path, "rb") as video_file:
+        await update.message.reply_video(
+            video=video_file,
+            caption=response_text,
+            parse_mode=ParseMode.MARKDOWN,
+            supports_streaming=True,
+        )
 
-            await status_msg.delete()
+      await status_msg.delete()
 
-        except Exception as e:
-            logger.error(f"Error in process_video: {e}")
-            await update.message.reply_text(
-                f"❌ *Gagal memproses video.*\nError: `{e}`", parse_mode="Markdown"
-            )
-        finally:
-            session.cleanup()
-            if user_id in self.sessions:
-                del self.sessions[user_id]
+    except Exception as e:
+      logger.error(f"Error in process_video: {e}")
+      await update.message.reply_text(
+          f"❌ *Gagal memproses video.*\nError: `{e}`", parse_mode="Markdown"
+      )
+    finally:
+      session.cleanup()
+      if user_id in self.sessions:
+        del self.sessions[user_id]
 
-    def run(self):
-        logger.info("🚀 Starting YouTube Clipper Bot...")
-        self.application.run_polling(drop_pending_updates=True)
+  def run(self):
+    logger.info("🚀 Starting YouTube Clipper Bot...")
+    self.application.run_polling(drop_pending_updates=True)
 
 
 # ==================== MAIN APPLICATION ====================
 def main():
-    Config.TEMP_DIR.mkdir(parents=True, exist_ok=True)
+  Config.TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-    keep_alive = KeepAliveServer()
-    keep_alive.run()
+  keep_alive = KeepAliveServer()
+  keep_alive.run()
 
-    bot = YouTubeClipperBot()
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(bot.initialize())
+  bot = YouTubeClipperBot()
+  loop = asyncio.new_event_loop()
+  asyncio.set_event_loop(loop)
+  loop.run_until_complete(bot.initialize())
 
-    bot.run()
+  bot.run()
 
 
 if __name__ == "__main__":
-    main()
+  main()
