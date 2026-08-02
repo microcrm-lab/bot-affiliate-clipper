@@ -96,7 +96,7 @@ class YouTubeDownloader:
     async def download_video(url: str, output_dir: Path) -> Optional[Dict]:
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        # 4 Lapis Fallback Format (Bypass error Requested format is not available)
+        # 4 Lapis Fallback Format
         format_strategies = [
             'b/best',                                       # Opsi 1: MP4/WebM tergabung (Paling aman untuk Shorts)
             'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best',   # Opsi 2: Standar kualitas tinggi
@@ -162,7 +162,7 @@ class AIProcessor:
         try:
             logger.info(f"🎤 Extracting audio & Transcribing: {video_path.name}")
             
-            # Ekstrak audio ke format .mp3 murni agar 100% didukung Groq Whisper
+            # Ekstrak audio ke format .m4a (Native AAC) agar 100% sukses di FFmpeg & Groq Whisper
             audio_path = await self._extract_audio(video_path)
             
             with open(audio_path, "rb") as audio_file:
@@ -202,19 +202,29 @@ class AIProcessor:
                 except Exception: pass
     
     async def _extract_audio(self, video_path: Path) -> Path:
-        audio_path = video_path.parent / f"audio_{uuid.uuid4().hex}.mp3"
+        if not video_path.exists():
+            raise FileNotFoundError(f"File video tidak ditemukan di lokasi: {video_path}")
+
+        audio_path = video_path.parent / f"audio_{uuid.uuid4().hex}.m4a"
         cmd = [
-            Config.FFMPEG_PATH, '-i', str(video_path),
-            '-vn', '-acodec', 'libmp3lame', '-ar', '16000',
-            '-ac', '1', '-b:a', '64k', str(audio_path), '-y'
+            Config.FFMPEG_PATH, '-y',
+            '-i', str(video_path),
+            '-vn',
+            '-c:a', 'aac',
+            '-ar', '16000',
+            '-ac', '1',
+            '-b:a', '64k',
+            str(audio_path)
         ]
         process = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
-        await process.communicate()
+        stdout, stderr = await process.communicate()
         
-        if not audio_path.exists() or audio_path.stat().st_size == 0:
-            raise RuntimeError("Gagal mengekstrak audio MP3 dari video.")
+        if process.returncode != 0 or not audio_path.exists() or audio_path.stat().st_size == 0:
+            err_log = stderr.decode('utf-8', errors='ignore') if stderr else 'Unknown Error'
+            logger.error(f"FFmpeg audio extraction error log: {err_log}")
+            raise RuntimeError(f"Gagal mengekstrak audio M4A dari video. FFmpeg: {err_log[:100]}")
             
         return audio_path
     
