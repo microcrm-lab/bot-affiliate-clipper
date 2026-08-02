@@ -97,10 +97,10 @@ class YouTubeDownloader:
         output_dir.mkdir(parents=True, exist_ok=True)
         
         format_strategies = [
-            'b/best',
-            'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best',
-            'bv*+ba*',
-            'all'
+            'b/best',                                       # Opsi 1: MP4/WebM tergabung (Paling aman untuk Shorts)
+            'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best',   # Opsi 2: Standar kualitas tinggi
+            'bv*+ba*',                                      # Opsi 3: Kualitas mentah
+            'all'                                           # Opsi 4: Paksa ambil apa saja dari YouTube
         ]
         
         last_error = None
@@ -128,25 +128,46 @@ class YouTubeDownloader:
                     logger.info(f"📥 Mencoba download dengan format '{fmt}'...")
                     info = ydl.extract_info(url, download=True)
                     
-                    # Filter HANYA file video jadi (abaikan file temp .part / .ytdl)
-                    valid_extensions = ('.mp4', '.mkv', '.webm', '.m4v')
-                    all_files = list(output_dir.glob(f"{file_prefix}_*.*"))
-                    video_files = [f for f in all_files if f.suffix.lower() in valid_extensions and not f.name.endswith('.part')]
-                    
-                    if not video_files:
-                        raise FileNotFoundError("Video terdownload tapi file utuh tidak ditemukan di disk.")
-                    
-                    video_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
-                    video_path = video_files[0]
+                    # DETEKSI LOKASI FILE PRESISE DARI YT-DLP
+                    expected_path = Path(ydl.prepare_filename(info))
+                    target_path = None
+
+                    # Cek 1: Jalur standar dari yt-dlp
+                    if expected_path.exists() and expected_path.stat().st_size > 1000:
+                        target_path = expected_path
+                    else:
+                        # Cek 2: Ekstensi yang mungkin berubah pasca-merge (.mp4, .mkv, .webm)
+                        for ext in ['.mp4', '.mkv', '.webm', '.m4v']:
+                            alt_path = expected_path.with_suffix(ext)
+                            if alt_path.exists() and alt_path.stat().st_size > 1000:
+                                target_path = alt_path
+                                break
+
+                    # Cek 3: Scan cadangan untuk file video apapun di folder temp
+                    if not target_path:
+                        valid_exts = ('.mp4', '.mkv', '.webm', '.m4v', '.mov')
+                        candidate_files = [
+                            f for f in output_dir.glob("*.*")
+                            if f.suffix.lower() in valid_exts 
+                            and not f.name.endswith('.part')
+                            and not f.name.endswith('.ytdl')
+                            and f.stat().st_size > 1000
+                        ]
+                        if candidate_files:
+                            candidate_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+                            target_path = candidate_files[0]
+
+                    if not target_path:
+                        raise FileNotFoundError("yt-dlp selesai tetapi file video utuh tidak ditemukan di disk.")
                     
                     metadata = {
-                        'video_path': video_path,
+                        'video_path': target_path,
                         'title': info.get('title', 'Unknown Title'),
                         'duration': info.get('duration', 0),
                         'video_id': info.get('id', ''),
                     }
                     
-                    logger.info(f"✅ Sukses download: {video_path.name}")
+                    logger.info(f"✅ Sukses download: {target_path.name}")
                     return metadata
                     
             except Exception as e:
@@ -155,7 +176,6 @@ class YouTubeDownloader:
                 continue
                 
         raise RuntimeError(f"Gagal memproses video dari YouTube: {last_error}")
-
 
 # ==================== AI PROCESSOR ====================
 class AIProcessor:
@@ -167,7 +187,7 @@ class AIProcessor:
         try:
             logger.info(f"🎤 Extracting audio & Transcribing: {video_path.name}")
             
-            # Ekstrak audio ke format .m4a (Native AAC) agar 100% sukses di FFmpeg & Groq Whisper
+            # Ekstrak audio ke format .m4a (Native AAC)
             audio_path = await self._extract_audio(video_path)
             
             with open(audio_path, "rb") as audio_file:
