@@ -79,7 +79,7 @@ class Config:
   USER_TIMEOUT = 300  # 5 minutes
 
   FLASK_PORT = int(os.getenv("PORT", 8080))
-  FFMPEG_PATH = "ffmpeg"
+  FFMPEG_PATH = shutil.which("ffmpeg") or "ffmpeg"
 
 
 # ==================== FLASK KEEP-ALIVE ====================
@@ -121,8 +121,8 @@ class YouTubeDownloader:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     format_strategies = [
+        "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
         "b/best",
-        "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best",
         "bv*+ba*",
         "all",
     ]
@@ -133,6 +133,7 @@ class YouTubeDownloader:
       file_prefix = f"vid_{uuid.uuid4().hex}"
       ydl_opts = {
           "outtmpl": str(Path(output_dir) / f"{file_prefix}_%(id)s.%(ext)s"),
+          "ffmpeg_location": Config.FFMPEG_PATH,  # Berikan lokasi FFmpeg ke yt-dlp secara tegas
           "extractor_args": {
               "youtube": {"player_client": ["android", "ios", "mweb"]}
           },
@@ -212,6 +213,7 @@ class AIProcessor:
     try:
       logger.info(f"🎤 Extracting audio & Transcribing: {video_path.name}")
 
+      # Ekstrak audio ke WAV (PCM 16kHz Mono) yang 100% stabil di FFmpeg & Groq Whisper
       audio_path = await self._extract_audio(video_path)
 
       with open(audio_path, "rb") as audio_file:
@@ -268,21 +270,19 @@ class AIProcessor:
           f"File video tidak ditemukan di lokasi: {video_path}"
       )
 
-    audio_path = video_path.parent / f"audio_{uuid.uuid4().hex}.m4a"
+    audio_path = video_path.parent / f"audio_{uuid.uuid4().hex}.wav"
     cmd = [
         Config.FFMPEG_PATH,
         "-y",
         "-i",
         str(video_path),
         "-vn",
-        "-c:a",
-        "aac",
+        "-acodec",
+        "pcm_s16le",  # Native PCM 16-bit
         "-ar",
-        "16000",
+        "16000",  # Sample rate 16kHz (Standard Whisper)
         "-ac",
-        "1",
-        "-b:a",
-        "64k",
+        "1",  # Mono channel
         str(audio_path),
     ]
     process = await asyncio.create_subprocess_exec(
@@ -298,9 +298,10 @@ class AIProcessor:
       err_log = (
           stderr.decode("utf-8", errors="ignore") if stderr else "Unknown Error"
       )
-      logger.error(f"FFmpeg audio extraction error log: {err_log}")
+      clean_error = err_log.strip()[-300:]  # Ambil 300 karakter terakhir
+      logger.error(f"FFmpeg audio extraction error log: {clean_error}")
       raise RuntimeError(
-          f"Gagal mengekstrak audio M4A dari video. FFmpeg: {err_log[:100]}"
+          f"Gagal mengekstrak audio WAV dari video. Detail: {clean_error}"
       )
 
     return audio_path
