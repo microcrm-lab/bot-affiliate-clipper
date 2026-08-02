@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 YouTube Video Clipper & AI Hook Finder Telegram Bot
-Created for Render.com Deployment
+Created for Render.com Deployment (Dual-Engine Bypasser)
 Python 3.10+
 """
 
@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 from typing import Dict, Optional
+import urllib.request
 import uuid
 
 # Telegram Bot
@@ -117,7 +118,9 @@ class KeepAliveServer:
 # ==================== YOUTUBE DOWNLOADER ====================
 class YouTubeDownloader:
     """
-    YouTube Downloader dengan Bypasser Datacenter IP menggunakan Android VR & TV Client
+    YouTube Downloader dengan Dual Engine:
+    1. Native yt-dlp (Mobile/VR Client + Cookies)
+    2. Auto-Fallback Engine (Cobalt API) jika IP Render Diblokir YouTube
     """
 
     @staticmethod
@@ -142,24 +145,59 @@ class YouTubeDownloader:
         return None
 
     @staticmethod
+    async def _cobalt_fallback_download(url: str, output_path: Path) -> bool:
+        """Engine Cadangan: Menembus IP Datacenter via Cobalt Bypasser API"""
+        def _download():
+            try:
+                logger.info("🚀 [Fallback Engine] Mengunduh video via Cobalt Bypasser API...")
+                req = urllib.request.Request(
+                    "https://api.cobalt.tools/api/json",
+                    data=json.dumps({"url": url, "videoQuality": "720"}).encode('utf-8'),
+                    headers={
+                        "Accept": "application/json",
+                        "Content-Type": "application/json",
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+                    },
+                    method="POST"
+                )
+                with urllib.request.urlopen(req, timeout=30) as response:
+                    res_data = json.loads(response.read().decode('utf-8'))
+                    
+                dl_url = res_data.get("url")
+                if not dl_url and res_data.get("status") == "picker":
+                    picker = res_data.get("picker", [])
+                    if picker and len(picker) > 0:
+                        dl_url = picker[0].get("url")
+                        
+                if dl_url:
+                    dl_req = urllib.request.Request(dl_url, headers={"User-Agent": "Mozilla/5.0"})
+                    with urllib.request.urlopen(dl_req, timeout=60) as dl_res, open(output_path, "wb") as f:
+                        shutil.copyfileobj(dl_res, f)
+                    return output_path.exists() and output_path.stat().st_size > 10000
+                return False
+            except Exception as e:
+                logger.warning(f"⚠️ Cobalt Fallback Error: {e}")
+                return False
+
+        return await asyncio.to_thread(_download)
+
+    @staticmethod
     async def download_video(url: str, output_dir: Path) -> Optional[Dict]:
         output_dir.mkdir(parents=True, exist_ok=True)
         file_prefix = f"vid_{uuid.uuid4().hex}"
 
-        # Strategi Bypass Menggunakan Client VR & TV (Bypass IP Block Render)
+        # Engine 1: yt-dlp Strategies
         strategies = [
             {"clients": ["android_vr"], "fmt": "best/b"},
             {"clients": ["tv"], "fmt": "best"},
-            {"clients": ["android_vr", "tv"], "fmt": "bv*+ba*/b"},
             {"clients": ["ios", "android"], "fmt": "b"},
-            {"clients": ["mweb", "web"], "fmt": None},
         ]
 
         last_error = None
 
         for attempt, strat in enumerate(strategies, 1):
             try:
-                logger.info(f"🔄 Mencoba strategi #{attempt} (Client: {strat['clients']}, Format: {strat['fmt'] or 'default'})...")
+                logger.info(f"🔄 Mencoba yt-dlp strategi #{attempt} (Client: {strat['clients']})...")
                 
                 ydl_opts = {
                     "outtmpl": str(Path(output_dir) / f"{file_prefix}_%(id)s.%(ext)s"),
@@ -174,44 +212,54 @@ class YouTubeDownloader:
                     "no_warnings": True,
                     "nocheckcertificate": True,
                     "geo_bypass": True,
-                    "socket_timeout": 30,
-                    "retries": 5,
+                    "socket_timeout": 20,
+                    "retries": 3,
                 }
 
                 if strat["fmt"] is not None:
                     ydl_opts["format"] = strat["fmt"]
 
-                # Cek dan muat cookies
                 cookie_file = Config.COOKIES_PATH
                 if cookie_file.exists():
-                    logger.info(f"🍪 Menggunakan cookies dari: {cookie_file}")
                     ydl_opts["cookiefile"] = str(cookie_file)
 
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(url, download=True)
-                    
                     downloaded_file = YouTubeDownloader._find_downloaded_file(output_dir, file_prefix)
 
                     if downloaded_file and downloaded_file.exists():
-                        logger.info(f"✅ Download Berhasil: {downloaded_file.name}")
-                        
+                        logger.info(f"✅ Download Berhasil via yt-dlp: {downloaded_file.name}")
                         final_path = downloaded_file
                         if downloaded_file.suffix.lower() != '.mp4':
                             final_path = await YouTubeDownloader._convert_to_mp4(downloaded_file)
 
                         return {
                             "video_path": final_path,
-                            "title": info.get("title", "Unknown Title"),
+                            "title": info.get("title", "YouTube Video"),
                             "duration": info.get("duration", 0),
                             "video_id": info.get("id", ""),
                         }
 
             except Exception as e:
-                logger.warning(f"⚠️ Strategi #{attempt} gagal: {e}")
+                logger.warning(f"⚠️ yt-dlp Strategi #{attempt} gagal: {e}")
                 last_error = e
                 await asyncio.sleep(1)
 
-        raise RuntimeError(f"Gagal mendownload video dari YouTube setelah mencoba semua strategi. Error: {last_error}")
+        # Engine 2: Fallback Bypasser API (Penyelamat jika IP Render Diblokir Total)
+        logger.warning("🛡️ IP Render terdeteksi diblokir total oleh YouTube. Mengaktifkan Fallback Engine (Cobalt Bypasser)...")
+        fallback_file = Path(output_dir) / f"{file_prefix}_fallback.mp4"
+        success = await YouTubeDownloader._cobalt_fallback_download(url, fallback_file)
+
+        if success:
+            logger.info(f"🎉 SUCCESS! Video berhasil didownload via Fallback Engine: {fallback_file.name}")
+            return {
+                "video_path": fallback_file,
+                "title": "YouTube Video",
+                "duration": 60,
+                "video_id": "fallback",
+            }
+
+        raise RuntimeError(f"Gagal mendownload video dari YouTube. Detail: {last_error}")
 
     @staticmethod
     async def _convert_to_mp4(input_path: Path) -> Path:
