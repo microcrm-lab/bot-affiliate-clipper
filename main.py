@@ -116,243 +116,138 @@ class KeepAliveServer:
 # ==================== YOUTUBE DOWNLOADER ====================
 class YouTubeDownloader:
   """
-  YouTube Video Downloader dengan strategi fallback bertingkat
-  untuk menghindari error format tidak tersedia
+  YouTube Video Downloader dengan penyamaran iOS Client
+  Bypass proteksi IP Datacenter Render
   """
 
   @staticmethod
-  def _get_format_strategies() -> list:
-    """
-    Mengembalikan daftar strategi format yang akan dicoba secara bertahap
-    """
-    return [
-      # Strategi 1: Format tunggal terbaik yang tersedia
-      "best",
-      
-      # Strategi 2: Format paling kompatibel
-      "b",
-      
-      # Strategi 3: Gabungan video dan audio terbaik  
-      "bestvideo+bestaudio/best",
-      
-      # Strategi 4: Ambil bestvideo dan bestaudio terpisah
-      "bestvideo*+bestaudio/best",
-      
-      # Strategi 5: Biarkan yt-dlp menentukan default
-      None,
-    ]
-
-  @staticmethod
   def _get_base_ydl_opts(output_dir: Path, file_prefix: str) -> dict:
-    """
-    Mengembalikan opsi dasar yt-dlp tanpa format spesifik
-    """
-    return {
-      "outtmpl": str(Path(output_dir) / f"{file_prefix}_%(id)s.%(ext)s"),
-      "merge_output_format": "mp4",  # FFmpeg akan menggabungkan ke MP4
-      "ffmpeg_location": Config.FFMPEG_PATH,
-      "extractor_args": {
-        "youtube": {
-          "player_client": ["android", "ios", "web", "mweb"]
-        }
-      },
-      "quiet": True,
-      "no_warnings": True,
-      "nocheckcertificate": True,
-      "geo_bypass": True,
-      "socket_timeout": 30,
-      "retries": 5,
-      "fragment_retries": 5,
-      "extract_flat": False,
-      "nooverwrites": True,
-      "continuedl": False,
+    opts = {
+        "outtmpl": str(Path(output_dir) / f"{file_prefix}_%(id)s.%(ext)s"),
+        "merge_output_format": "mp4",
+        "ffmpeg_location": Config.FFMPEG_PATH,
+        # Kunci Bypass: HANYA gunakan 'ios' dan 'android' (tanpa 'web')
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["ios", "android"]
+            }
+        },
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+        "quiet": True,
+        "no_warnings": True,
+        "nocheckcertificate": True,
+        "geo_bypass": True,
+        "socket_timeout": 30,
+        "retries": 10,
     }
+
+    if os.path.exists(Config.COOKIES_PATH):
+      opts["cookiefile"] = Config.COOKIES_PATH
+
+    return opts
 
   @staticmethod
   def _find_downloaded_file(output_dir: Path, file_prefix: str) -> Optional[Path]:
-    """
-    Mencari file video yang berhasil didownload dengan filter ketat
-    """
-    # Ekstensi video yang valid
-    valid_extensions = {".mp4", ".mkv", ".webm", ".m4v", ".flv", ".avi", ".mov", ".3gp"}
+    valid_extensions = {".mp4", ".mkv", ".webm", ".m4v", ".mov"}
     
-    # Cari file dengan prefix yang sesuai
-    candidate_files = []
+    # Cari berdasarkan file_prefix
+    candidate_files = [
+        f for f in output_dir.glob(f"{file_prefix}_*.*")
+        if f.suffix.lower() in valid_extensions 
+        and not f.name.endswith(".part") 
+        and not f.name.endswith(".ytdl")
+        and f.stat().st_size > 10000
+    ]
     
-    # Strategy 1: Cari file dengan prefix yang tepat
-    prefix_files = list(output_dir.glob(f"{file_prefix}_*.*"))
-    for f in prefix_files:
-      if (f.suffix.lower() in valid_extensions and 
-          not f.name.endswith(".part") and 
-          not f.name.endswith(".ytdl") and
-          not f.name.endswith(".frag") and
-          f.stat().st_size > 10000):  # Minimal 10KB
-        candidate_files.append(f)
-    
-    # Strategy 2: Jika tidak ditemukan, cari semua file video di direktori
     if not candidate_files:
       all_files = sorted(output_dir.glob("*.*"), key=lambda x: x.stat().st_mtime, reverse=True)
-      for f in all_files:
-        if (f.suffix.lower() in valid_extensions and 
-            not f.name.endswith(".part") and 
-            not f.name.endswith(".ytdl") and
-            not f.name.endswith(".frag") and
-            f.stat().st_size > 10000):
-          candidate_files.append(f)
-          break  # Ambil file terbaru saja
-    
-    # Strategy 3: Cari file MP4 apapun sebagai last resort
-    if not candidate_files:
-      mp4_files = sorted(output_dir.glob("*.mp4"), key=lambda x: x.stat().st_mtime, reverse=True)
-      for f in mp4_files:
-        if f.stat().st_size > 10000:
-          candidate_files.append(f)
-          break
-    
+      candidate_files = [f for f in all_files if f.suffix.lower() in valid_extensions and f.stat().st_size > 10000]
+
     if candidate_files:
-      # Pilih file terbaru dan terbesar
-      candidate_files.sort(key=lambda x: (x.stat().st_mtime, x.stat().st_size), reverse=True)
       return candidate_files[0]
-    
+
     return None
 
   @staticmethod
   async def download_video(url: str, output_dir: Path) -> Optional[Dict]:
-    """
-    Download video YouTube dengan strategi fallback format bertingkat
-    """
     output_dir.mkdir(parents=True, exist_ok=True)
     file_prefix = f"vid_{uuid.uuid4().hex}"
-    
-    format_strategies = YouTubeDownloader._get_format_strategies()
+
+    # Strategi format ramah Mobile Client
+    format_strategies = [
+        "bestvideo+bestaudio/best",
+        "bv*+ba*",
+        "best",
+        "b",
+        None
+    ]
+
     last_error = None
-    
-    for attempt, format_strategy in enumerate(format_strategies, 1):
+
+    for attempt, fmt in enumerate(format_strategies, 1):
       try:
-        logger.info(f"🔄 Mencoba download dengan strategi format #{attempt}: {format_strategy}")
-        
-        # Buat opsi yt-dlp untuk strategi ini
+        logger.info(f"🔄 [Bypass Mode] Mencoba strategi #{attempt}: {fmt or 'default'}")
         ydl_opts = YouTubeDownloader._get_base_ydl_opts(output_dir, file_prefix)
-        
-        # Set format sesuai strategi
-        if format_strategy is not None:
-          ydl_opts["format"] = format_strategy
-        # Jika None, biarkan yt-dlp menggunakan default
-        
-        # Tambahkan cookies jika tersedia
-        if os.path.exists(Config.COOKIES_PATH):
-          ydl_opts["cookiefile"] = Config.COOKIES_PATH
-        
-        # Download video
+
+        if fmt is not None:
+          ydl_opts["format"] = fmt
+
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-          logger.info(f"📥 Mendownload video dengan format: {format_strategy or 'default'}")
           info = ydl.extract_info(url, download=True)
           
-          # Cari file hasil download
           downloaded_file = YouTubeDownloader._find_downloaded_file(output_dir, file_prefix)
-          
+
           if downloaded_file and downloaded_file.exists():
-            logger.info(f"✅ Berhasil download: {downloaded_file.name} ({downloaded_file.stat().st_size / 1024 / 1024:.1f} MB)")
+            logger.info(f"✅ Download Berhasil: {downloaded_file.name}")
             
-            # Verifikasi file valid
-            if downloaded_file.stat().st_size > 0:
-              # Convert ke MP4 jika bukan format MP4
-              final_path = downloaded_file
-              if downloaded_file.suffix.lower() != '.mp4':
-                final_path = await YouTubeDownloader._convert_to_mp4(downloaded_file)
-              
-              metadata = {
+            # Konversi jika bukan MP4
+            final_path = downloaded_file
+            if downloaded_file.suffix.lower() != '.mp4':
+              final_path = await YouTubeDownloader._convert_to_mp4(downloaded_file)
+
+            return {
                 "video_path": final_path,
                 "title": info.get("title", "Unknown Title"),
                 "duration": info.get("duration", 0),
                 "video_id": info.get("id", ""),
-              }
-              
-              logger.info(f"✅ Sukses download dengan strategi format #{attempt}")
-              return metadata
-          
-          logger.warning(f"⚠️ File tidak ditemukan setelah download dengan strategi #{attempt}")
-          
+            }
+
       except Exception as e:
-        error_msg = str(e)
+        logger.warning(f"⚠️ Strategi #{attempt} gagal: {e}")
         last_error = e
-        
-        # Log error yang lebih informatif
-        if "Requested format is not available" in error_msg:
-          logger.warning(f"⚠️ Format tidak tersedia dengan strategi #{attempt}, mencoba strategi berikutnya...")
-        elif "HTTP Error" in error_msg:
-          logger.warning(f"⚠️ HTTP Error dengan strategi #{attempt}: {error_msg[:100]}")
-        elif "Video unavailable" in error_msg:
-          logger.error(f"❌ Video tidak tersedia: {error_msg[:100]}")
-          raise RuntimeError(f"Video tidak tersedia di YouTube: {url}")
-        else:
-          logger.warning(f"⚠️ Error dengan strategi #{attempt}: {error_msg[:100]}")
-        
-        # Jika ini attempt terakhir, raise error
-        if attempt == len(format_strategies):
-          break
-        
-        # Tunggu sebentar sebelum mencoba lagi
-        await asyncio.sleep(2)
-    
-    # Jika semua strategi gagal
-    error_message = "Gagal mendownload video setelah mencoba semua strategi format."
-    if last_error:
-      error_message += f" Error terakhir: {str(last_error)[:200]}"
-    
-    logger.error(f"❌ {error_message}")
-    raise RuntimeError(error_message)
+        await asyncio.sleep(1)
+
+    raise RuntimeError(f"Gagal mendownload video YouTube (Terdeteksi IP Block Render). Error: {last_error}")
 
   @staticmethod
   async def _convert_to_mp4(input_path: Path) -> Path:
-    """
-    Konversi video ke format MP4 menggunakan FFmpeg
-    """
     try:
       output_path = input_path.parent / f"{input_path.stem}_converted.mp4"
-      
-      # Skip jika sudah MP4
       if input_path.suffix.lower() == '.mp4':
         return input_path
-      
-      logger.info(f"🔄 Mengkonversi {input_path.suffix} ke MP4...")
-      
+
       cmd = [
-        Config.FFMPEG_PATH,
-        "-i", str(input_path),
-        "-c:v", "libx264",
-        "-preset", "fast",
-        "-crf", "23",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-movflags", "+faststart",
-        str(output_path),
-        "-y"
+          Config.FFMPEG_PATH, "-i", str(input_path),
+          "-c:v", "libx264", "-preset", "ultrafast",
+          "-crf", "23", "-c:a", "aac", "-b:a", "128k",
+          "-movflags", "+faststart", str(output_path), "-y"
       ]
       
       process = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
+          *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
       )
-      
-      stdout, stderr = await process.communicate()
-      
-      if process.returncode != 0 or not output_path.exists() or output_path.stat().st_size == 0:
-        logger.warning(f"⚠️ Konversi gagal, menggunakan file original")
-        return input_path
-      
-      # Hapus file original jika konversi berhasil
-      try:
-        input_path.unlink()
-      except:
-        pass
-      
-      logger.info(f"✅ Konversi berhasil: {output_path.name}")
-      return output_path
-      
-    except Exception as e:
-      logger.warning(f"⚠️ Error konversi, menggunakan file original: {e}")
+      await process.communicate()
+
+      if process.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0:
+        try: input_path.unlink()
+        except: pass
+        return output_path
+
+      return input_path
+    except Exception:
       return input_path
 
 
