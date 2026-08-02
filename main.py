@@ -92,56 +92,67 @@ class KeepAliveServer:
 # ==================== YOUTUBE DOWNLOADER ====================
 class YouTubeDownloader:
     @staticmethod
-    def get_ydl_opts(output_path: str) -> dict:
-        opts = {
-            'format': 'bv*+ba*/b/best',
-            'outtmpl': str(Path(output_path) / '%(title).100s_%(id)s.%(ext)s'),
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['android', 'ios', 'mweb'],
-                }
-            },
-            'merge_output_format': 'mp4',
-            'quiet': True,
-            'no_warnings': True,
-            'restrictfilenames': True,
-            'nocheckcertificate': True,
-            'socket_timeout': 30,
-            'retries': 3,
-        }
-        if os.path.exists(Config.COOKIES_PATH):
-            opts['cookiefile'] = Config.COOKIES_PATH
-        return opts
-    
-    @staticmethod
     async def download_video(url: str, output_dir: Path) -> Optional[Dict]:
-        try:
-            output_dir.mkdir(parents=True, exist_ok=True)
-            ydl_opts = YouTubeDownloader.get_ydl_opts(str(output_dir))
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 4 Lapis Fallback Format (Anti Error "Requested format is not available")
+        format_strategies = [
+            'b/best',                                       # Opsi 1: MP4/WebM tergabung (Paling aman buat Shorts)
+            'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best',   # Opsi 2: Standar kualitas tinggi
+            'bv*+ba*',                                      # Opsi 3: Kualitas mentah
+            'all'                                           # Opsi 4: Paksa ambil apa saja yang dikasih YouTube
+        ]
+        
+        last_error = None
+        
+        for fmt in format_strategies:
+            ydl_opts = {
+                'outtmpl': str(Path(output_dir) / f'vid_{uuid.uuid4().hex}_%(id)s.%(ext)s'),
+                'extractor_args': {
+                    'youtube': {
+                        'player_client': ['android', 'ios', 'mweb']
+                    }
+                },
+                'format': fmt,
+                'quiet': True,
+                'no_warnings': True,
+                'nocheckcertificate': True,
+            }
             
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                logger.info(f"📥 Downloading video: {url}")
-                info = ydl.extract_info(url, download=True)
+            if os.path.exists(Config.COOKIES_PATH):
+                ydl_opts['cookiefile'] = Config.COOKIES_PATH
+
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    logger.info(f"📥 Mencoba download dengan format '{fmt}'...")
+                    info = ydl.extract_info(url, download=True)
+                    
+                    # Cari file yang barusan selesai didownload
+                    video_files = list(output_dir.glob("vid_*.mp4")) or list(output_dir.glob("vid_*.*"))
+                    if not video_files:
+                        raise FileNotFoundError("Video terdownload tapi file gagal disimpan ke disk.")
+                    
+                    # Ambil file terbaru
+                    video_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+                    video_path = video_files[0]
+                    
+                    metadata = {
+                        'video_path': video_path,
+                        'title': info.get('title', 'Unknown Title'),
+                        'duration': info.get('duration', 0),
+                        'video_id': info.get('id', ''),
+                    }
+                    
+                    logger.info(f"✅ Sukses download dengan format: {fmt}")
+                    return metadata
+                    
+            except Exception as e:
+                logger.warning(f"Format '{fmt}' ditolak: {e}")
+                last_error = e
+                continue # Langsung coba format selanjutnya tanpa stop bot
                 
-                video_files = list(output_dir.glob("*.mp4")) or list(output_dir.glob("*.*"))
-                if not video_files:
-                    raise FileNotFoundError("Downloaded video file not found")
-                
-                video_path = video_files[0]
-                
-                metadata = {
-                    'video_path': video_path,
-                    'title': info.get('title', 'Unknown Title'),
-                    'duration': info.get('duration', 0),
-                    'video_id': info.get('id', ''),
-                }
-                
-                logger.info(f"✅ Downloaded: {metadata['title']} ({metadata['duration']}s)")
-                return metadata
-                
-        except Exception as e:
-            logger.error(f"❌ Download failed: {e}")
-            raise
+        # Kalau keempat opsi di atas gagal semua, baru munculkan error
+        raise RuntimeError(f"Gagal memproses format video dari YouTube. Error detail: {last_error}")
 
 # ==================== AI PROCESSOR ====================
 class AIProcessor:
