@@ -120,11 +120,13 @@ class YouTubeDownloader:
   async def download_video(url: str, output_dir: Path) -> Optional[Dict]:
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Format strategi yang WAJIB mengandung trek suara (acodec!=none)
     format_strategies = [
-        "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        "b/best",
-        "bv*+ba*",
-        "all",
+        "best[ext=mp4][acodec!=none]/best[acodec!=none]/b",  # Format tunggal yang sudah ada suaranya
+        (
+            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio"
+        ),  # Gabungkan video+audio via ffmpeg
+        "b/best",  # Fallback standar
     ]
 
     last_error = None
@@ -133,7 +135,7 @@ class YouTubeDownloader:
       file_prefix = f"vid_{uuid.uuid4().hex}"
       ydl_opts = {
           "outtmpl": str(Path(output_dir) / f"{file_prefix}_%(id)s.%(ext)s"),
-          "ffmpeg_location": Config.FFMPEG_PATH,  # Berikan lokasi FFmpeg ke yt-dlp secara tegas
+          "ffmpeg_location": Config.FFMPEG_PATH,
           "extractor_args": {
               "youtube": {"player_client": ["android", "ios", "mweb"]}
           },
@@ -213,7 +215,6 @@ class AIProcessor:
     try:
       logger.info(f"🎤 Extracting audio & Transcribing: {video_path.name}")
 
-      # Ekstrak audio ke WAV (PCM 16kHz Mono) yang 100% stabil di FFmpeg & Groq Whisper
       audio_path = await self._extract_audio(video_path)
 
       with open(audio_path, "rb") as audio_file:
@@ -278,11 +279,11 @@ class AIProcessor:
         str(video_path),
         "-vn",
         "-acodec",
-        "pcm_s16le",  # Native PCM 16-bit
+        "pcm_s16le",
         "-ar",
-        "16000",  # Sample rate 16kHz (Standard Whisper)
+        "16000",
         "-ac",
-        "1",  # Mono channel
+        "1",
         str(audio_path),
     ]
     process = await asyncio.create_subprocess_exec(
@@ -298,10 +299,11 @@ class AIProcessor:
       err_log = (
           stderr.decode("utf-8", errors="ignore") if stderr else "Unknown Error"
       )
-      clean_error = err_log.strip()[-300:]  # Ambil 300 karakter terakhir
+      clean_error = err_log.strip()[-300:]
       logger.error(f"FFmpeg audio extraction error log: {clean_error}")
       raise RuntimeError(
-          f"Gagal mengekstrak audio WAV dari video. Detail: {clean_error}"
+          "Gagal mengekstrak audio dari video (pastikan video memiliki suara)."
+          f" Detail: {clean_error}"
       )
 
     return audio_path
