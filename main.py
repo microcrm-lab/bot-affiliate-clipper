@@ -9,6 +9,7 @@ import os
 import re
 import sys
 import json
+import uuid
 import logging
 import shutil
 import asyncio
@@ -95,7 +96,7 @@ class YouTubeDownloader:
     async def download_video(url: str, output_dir: Path) -> Optional[Dict]:
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        # 4 Lapis Fallback Format (Anti Error "Requested format is not available")
+        # 4 Lapis Fallback Format (Anti Error Requested format is not available)
         format_strategies = [
             'b/best',                                       # Opsi 1: MP4/WebM tergabung (Paling aman buat Shorts)
             'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best',   # Opsi 2: Standar kualitas tinggi
@@ -127,12 +128,10 @@ class YouTubeDownloader:
                     logger.info(f"📥 Mencoba download dengan format '{fmt}'...")
                     info = ydl.extract_info(url, download=True)
                     
-                    # Cari file yang barusan selesai didownload
                     video_files = list(output_dir.glob("vid_*.mp4")) or list(output_dir.glob("vid_*.*"))
                     if not video_files:
                         raise FileNotFoundError("Video terdownload tapi file gagal disimpan ke disk.")
                     
-                    # Ambil file terbaru
                     video_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
                     video_path = video_files[0]
                     
@@ -149,9 +148,8 @@ class YouTubeDownloader:
             except Exception as e:
                 logger.warning(f"Format '{fmt}' ditolak: {e}")
                 last_error = e
-                continue # Langsung coba format selanjutnya tanpa stop bot
+                continue
                 
-        # Kalau keempat opsi di atas gagal semua, baru munculkan error
         raise RuntimeError(f"Gagal memproses format video dari YouTube. Error detail: {last_error}")
 
 # ==================== AI PROCESSOR ====================
@@ -468,7 +466,7 @@ _{hook_analysis['clip_transcript'][:300]}_
                 
         except Exception as e:
             logger.error(f"Error in process_video: {e}")
-            await update.message.reply_text(f"❌ *Gagal memproses video.*\nError: `{e}`", parse_mode=ParseMode.MARKDOWN)
+            await update.message.reply_text(f"❌ *Gagal memproses video.*\nError: `{e}`", parse_mode="Markdown")
         finally:
             session.cleanup()
             if user_id in self.sessions:
