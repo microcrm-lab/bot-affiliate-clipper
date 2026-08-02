@@ -96,12 +96,12 @@ class YouTubeDownloader:
     async def download_video(url: str, output_dir: Path) -> Optional[Dict]:
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        # 4 Lapis Fallback Format (Anti Error Requested format is not available)
+        # 4 Lapis Fallback Format (Bypass error Requested format is not available)
         format_strategies = [
-            'b/best',                                       # Opsi 1: MP4/WebM tergabung (Paling aman buat Shorts)
+            'b/best',                                       # Opsi 1: MP4/WebM tergabung (Paling aman untuk Shorts)
             'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best',   # Opsi 2: Standar kualitas tinggi
             'bv*+ba*',                                      # Opsi 3: Kualitas mentah
-            'all'                                           # Opsi 4: Paksa ambil apa saja yang dikasih YouTube
+            'all'                                           # Opsi 4: Paksa ambil apa saja dari YouTube
         ]
         
         last_error = None
@@ -130,7 +130,7 @@ class YouTubeDownloader:
                     
                     video_files = list(output_dir.glob("vid_*.mp4")) or list(output_dir.glob("vid_*.*"))
                     if not video_files:
-                        raise FileNotFoundError("Video terdownload tapi file gagal disimpan ke disk.")
+                        raise FileNotFoundError("Video terdownload tapi file tidak ditemukan di disk.")
                     
                     video_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
                     video_path = video_files[0]
@@ -158,18 +158,16 @@ class AIProcessor:
         self.client = AsyncGroq(api_key=Config.GROQ_API_KEY)
     
     async def transcribe_video(self, video_path: Path) -> Dict:
+        audio_path = None
         try:
-            logger.info(f"🎤 Transcribing: {video_path.name}")
+            logger.info(f"🎤 Extracting audio & Transcribing: {video_path.name}")
             
-            file_size = video_path.stat().st_size
-            if file_size > 24 * 1024 * 1024:
-                media_file = await self._extract_audio(video_path)
-            else:
-                media_file = video_path
+            # Ekstrak audio ke format .mp3 murni agar 100% didukung Groq Whisper
+            audio_path = await self._extract_audio(video_path)
             
-            with open(media_file, "rb") as audio_file:
+            with open(audio_path, "rb") as audio_file:
                 transcription = await self.client.audio.transcriptions.create(
-                    file=(video_path.name, audio_file.read()),
+                    file=(audio_path.name, audio_file.read()),
                     model="whisper-large-v3",
                     response_format="verbose_json",
                     timestamp_granularities=["segment"]
@@ -198,9 +196,13 @@ class AIProcessor:
         except Exception as e:
             logger.error(f"❌ Transcription failed: {e}")
             raise
+        finally:
+            if audio_path and os.path.exists(audio_path):
+                try: os.remove(audio_path)
+                except Exception: pass
     
     async def _extract_audio(self, video_path: Path) -> Path:
-        audio_path = video_path.parent / f"{video_path.stem}_audio.mp3"
+        audio_path = video_path.parent / f"audio_{uuid.uuid4().hex}.mp3"
         cmd = [
             Config.FFMPEG_PATH, '-i', str(video_path),
             '-vn', '-acodec', 'libmp3lame', '-ar', '16000',
@@ -210,6 +212,10 @@ class AIProcessor:
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
         await process.communicate()
+        
+        if not audio_path.exists() or audio_path.stat().st_size == 0:
+            raise RuntimeError("Gagal mengekstrak audio MP3 dari video.")
+            
         return audio_path
     
     async def find_viral_hook(self, transcription: Dict, video_duration: int) -> Dict:
