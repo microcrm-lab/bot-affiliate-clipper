@@ -71,7 +71,8 @@ logger = logging.getLogger(__name__)
 class Config:
     TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_BOT_TOKEN_HERE")
     GROQ_API_KEY = os.getenv("GROQ_API_KEY", "YOUR_GROQ_API_KEY_HERE")
-    COOKIES_PATH = os.getenv("COOKIES_PATH", "./cookies.txt")
+    BASE_DIR = Path(__file__).resolve().parent
+    COOKIES_PATH = BASE_DIR / "cookies.txt"
     TEMP_DIR = Path("/tmp/yt_clipper_bot")
 
     MAX_CLIP_DURATION = 60  # seconds
@@ -116,45 +117,8 @@ class KeepAliveServer:
 # ==================== YOUTUBE DOWNLOADER ====================
 class YouTubeDownloader:
     """
-    YouTube Downloader dengan Validasi Cookie & Android/iOS Mobile Client
+    YouTube Downloader dengan Rotasi Player Client & Path Cookies Presisi
     """
-
-    @staticmethod
-    def _get_base_ydl_opts(output_dir: Path, file_prefix: str) -> dict:
-        opts = {
-            "outtmpl": str(Path(output_dir) / f"{file_prefix}_%(id)s.%(ext)s"),
-            "merge_output_format": "mp4",
-            "ffmpeg_location": Config.FFMPEG_PATH,
-            "extractor_args": {
-                "youtube": {
-                    "player_client": ["android", "ios"]
-                }
-            },
-            "quiet": True,
-            "no_warnings": True,
-            "nocheckcertificate": True,
-            "geo_bypass": True,
-            "socket_timeout": 30,
-            "retries": 10,
-        }
-
-        # Cek dan muat cookies jika ada
-        cookie_file = Path(Config.COOKIES_PATH)
-        if cookie_file.exists():
-            # Verifikasi sederhana apakah file cookie tidak terpotong
-            try:
-                content = cookie_file.read_text(encoding="utf-8", errors="ignore")
-                if "youtube.com" in content or "google.com" in content:
-                    logger.info(f"🍪 Cookie YouTube valid terdeteksi: {cookie_file}")
-                    opts["cookiefile"] = str(cookie_file)
-                else:
-                    logger.warning("⚠️ File cookies.txt terdeteksi KORUPSI/TERPOTONG! yt-dlp tidak memuatnya.")
-            except Exception as e:
-                logger.warning(f"⚠️ Gagal membaca cookies.txt: {e}")
-        else:
-            logger.warning("⚠️ File cookies.txt tidak ditemukan di root directory!")
-
-        return opts
 
     @staticmethod
     def _find_downloaded_file(output_dir: Path, file_prefix: str) -> Optional[Path]:
@@ -182,23 +146,47 @@ class YouTubeDownloader:
         output_dir.mkdir(parents=True, exist_ok=True)
         file_prefix = f"vid_{uuid.uuid4().hex}"
 
-        format_strategies = [
-            "bestvideo+bestaudio/best",
-            "bv*+ba*",
-            "best",
-            "b",
-            None
+        # Rotasi player_client & format strategy
+        strategies = [
+            {"client": ["mweb"], "fmt": "b/best"},
+            {"client": ["android"], "fmt": "bv*+ba/b"},
+            {"client": ["ios"], "fmt": "best"},
+            {"client": ["web"], "fmt": None},
         ]
 
         last_error = None
 
-        for attempt, fmt in enumerate(format_strategies, 1):
+        for attempt, strat in enumerate(strategies, 1):
             try:
-                logger.info(f"🔄 Mencoba strategi #{attempt}: {fmt or 'default'}")
-                ydl_opts = YouTubeDownloader._get_base_ydl_opts(output_dir, file_prefix)
+                logger.info(f"🔄 Mencoba strategi #{attempt} (Client: {strat['client']}, Format: {strat['fmt'] or 'default'})...")
+                
+                ydl_opts = {
+                    "outtmpl": str(Path(output_dir) / f"{file_prefix}_%(id)s.%(ext)s"),
+                    "merge_output_format": "mp4",
+                    "ffmpeg_location": Config.FFMPEG_PATH,
+                    "extractor_args": {
+                        "youtube": {
+                            "player_client": strat["client"]
+                        }
+                    },
+                    "quiet": True,
+                    "no_warnings": True,
+                    "nocheckcertificate": True,
+                    "geo_bypass": True,
+                    "socket_timeout": 30,
+                    "retries": 5,
+                }
 
-                if fmt is not None:
-                    ydl_opts["format"] = fmt
+                if strat["fmt"] is not None:
+                    ydl_opts["format"] = strat["fmt"]
+
+                # Cek dan muat cookies
+                cookie_file = Config.COOKIES_PATH
+                if cookie_file.exists():
+                    logger.info(f"🍪 Menggunakan cookies dari: {cookie_file}")
+                    ydl_opts["cookiefile"] = str(cookie_file)
+                else:
+                    logger.warning(f"⚠️ File cookies tidak ditemukan di: {cookie_file}")
 
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(url, download=True)
@@ -224,7 +212,7 @@ class YouTubeDownloader:
                 last_error = e
                 await asyncio.sleep(1)
 
-        raise RuntimeError(f"Gagal mendownload video YouTube. Pastikan file cookies.txt di GitHub sudah diperbaiki. Error: {last_error}")
+        raise RuntimeError(f"Gagal mendownload video dari YouTube setelah mencoba semua strategi. Error: {last_error}")
 
     @staticmethod
     async def _convert_to_mp4(input_path: Path) -> Path:
