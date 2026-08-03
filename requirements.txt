@@ -1,6 +1,8 @@
-python-telegram-bot==20.8
-flask==3.0.0
-gunicorn==21.2.0
-groq==0.4.2
-static-ffmpeg==2.7
+python-telegram-bot>=20.8
+flask>=3.0.0
+gunicorn>=21.2.0
+groq>=0.4.2
+static-ffmpeg>=2.7
 pytubefix
+requests>=2.31.0
+python-dotenv>=1.0.1
