@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 YouTube Video Clipper & AI Hook Finder Telegram Bot
-Created for Render.com Deployment (Webshare Proxy Engine - Working Version)
+Created for Render.com Deployment (Webshare Proxy Engine)
 Python 3.10+
 """
 
@@ -86,7 +86,7 @@ class Config:
     FLASK_PORT = int(os.getenv("PORT", 8080))
     FFMPEG_PATH = shutil.which("ffmpeg") or "ffmpeg"
 
-    # Webshare Proxy Configuration
+    # Webshare Proxy Configuration (Membypass Blokir IP Datacenter Render)
     WEBSHARE_PROXY = os.getenv(
         "WEBSHARE_PROXY",
         "http://ymfbkidl:s2rh40rg42t9@31.59.20.176:6754/"
@@ -140,6 +140,9 @@ class KeepAliveServer:
 
 # ==================== YOUTUBE DOWNLOADER ====================
 class YouTubeDownloader:
+    """
+    YouTube Downloader dengan Webshare Proxy Bypasser
+    """
 
     CLIENT_STRATEGIES = ["MWEB", "WEB", "IOS"]
 
@@ -195,6 +198,7 @@ class YouTubeDownloader:
 
     @staticmethod
     async def _invidious_fallback_download(url: str, output_path: Path) -> Optional[Dict]:
+        """Fallback Engine via Invidious Node"""
         video_id = url.split("/")[-1].split("?")[0].replace("watch?v=", "")
         instances = [
             "https://invidious.drgns.space",
@@ -708,8 +712,8 @@ class YouTubeClipperBot:
 🏷️ *Judul Viral:* {smart_title}
 📹 *Video:* {metadata['title'][:100]}
 ⏱️ *Durasi Klip:* {hook_analysis['start_time']} - {hook_analysis['end_time']}
-🎯 *Kekuatan Hook:* {hook_analysis['hook_strength']}
-📊 *Tipe Hook:* {hook_analysis['hook_type']}
+🎯 *Kekuatan Hook:* {hook_analysis['hook_strength']}/10
+📊 *Tipe Hook:* {hook_analysis['hook_type'].title()}
 
 💡 *Analisis Hook:*
 {hook_analysis['hook_analysis']}
