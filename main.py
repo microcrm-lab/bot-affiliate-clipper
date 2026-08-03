@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 YouTube Video Clipper & AI Hook Finder Telegram Bot
-Created for Render.com Deployment (Webshare Proxy Engine)
+Created for Render.com Deployment (Webshare Proxy + AI Prompt Fix + Vertical Crop)
 Python 3.10+
 """
 
@@ -80,13 +80,13 @@ class Config:
     TEMP_DIR = Path("/tmp/yt_clipper_bot")
 
     MAX_CLIP_DURATION = 60  # seconds
-    MIN_CLIP_DURATION = 15  # seconds
+    MIN_CLIP_DURATION = 20  # minimal 20 detik agar tidak kepotong 2 detik lagi
     USER_TIMEOUT = 300  # 5 minutes
 
     FLASK_PORT = int(os.getenv("PORT", 8080))
     FFMPEG_PATH = shutil.which("ffmpeg") or "ffmpeg"
 
-    # Webshare Proxy Configuration (Membypass Blokir IP Datacenter Render)
+    # Webshare Proxy Configuration
     WEBSHARE_PROXY = os.getenv(
         "WEBSHARE_PROXY",
         "http://ymfbkidl:s2rh40rg42t9@31.59.20.176:6754/"
@@ -96,7 +96,7 @@ class Config:
     PYTUBEFIX_TOKEN_DIR = BASE_DIR / ".pytubefix_tokens"
 
 
-# Setup Global Proxy untuk urllib Request
+# Setup Global Proxy
 if Config.WEBSHARE_PROXY:
     proxy_support = urllib.request.ProxyHandler({
         "http": Config.WEBSHARE_PROXY,
@@ -104,7 +104,7 @@ if Config.WEBSHARE_PROXY:
     })
     opener = urllib.request.build_opener(proxy_support)
     urllib.request.install_opener(opener)
-    logger.info("🌐 Webshare Proxy berhasil diaktifkan secara global!")
+    logger.info("🌐 Webshare Proxy diaktifkan!")
 
 
 # ==================== FLASK KEEP-ALIVE ====================
@@ -140,9 +140,6 @@ class KeepAliveServer:
 
 # ==================== YOUTUBE DOWNLOADER ====================
 class YouTubeDownloader:
-    """
-    YouTube Downloader dengan Webshare Proxy Bypasser
-    """
 
     CLIENT_STRATEGIES = ["MWEB", "WEB", "IOS"]
 
@@ -198,7 +195,6 @@ class YouTubeDownloader:
 
     @staticmethod
     async def _invidious_fallback_download(url: str, output_path: Path) -> Optional[Dict]:
-        """Fallback Engine via Invidious Node"""
         video_id = url.split("/")[-1].split("?")[0].replace("watch?v=", "")
         instances = [
             "https://invidious.drgns.space",
@@ -245,7 +241,6 @@ class YouTubeDownloader:
         file_prefix = f"vid_{uuid.uuid4().hex}"
         last_error = None
 
-        # Engine 1: pytubefix + Webshare Proxy
         for attempt, client in enumerate(YouTubeDownloader.CLIENT_STRATEGIES, 1):
             try:
                 logger.info(f"🔄 [Webshare Proxy] Mencoba pytubefix strategi #{attempt} (Client: {client})...")
@@ -278,7 +273,6 @@ class YouTubeDownloader:
                 last_error = e
                 await asyncio.sleep(1)
 
-        # Engine 2: Fallback Engine
         logger.warning("🛡️ Mengaktifkan Fallback Engine (Invidious Proxied Stream)...")
         fallback_file = Path(output_dir) / f"{file_prefix}_fallback.mp4"
         inv_result = await YouTubeDownloader._invidious_fallback_download(url, fallback_file)
@@ -434,26 +428,28 @@ class AIProcessor:
             logger.info("🔍 Analyzing transcription for viral hooks...")
             segments_text = json.dumps(transcription["segments"], indent=2)
 
-            prompt = f"""You are a viral content expert analyzing a YouTube video transcript.
-Video total duration: {video_duration} seconds.
+            prompt = f"""Kamu adalah pakar konten viral TikTok Indonesia.
+Total durasi video asli: {video_duration} detik.
 
-Analyze these timestamped segments and find the SINGLE most engaging, viral-worthy clip (15-60 seconds).
+Tugasmu: Analisis transkrip di bawah ini dan pilih 1 BAGIAN PALING MENARIK & EDUKATIF yang berdurasi MINIMAL 25 DETIK dan MAKSIMAL 60 DETIK.
 
-Segments with timestamps:
+PENTING: 
+- JANGAN cuma memilih 2-5 detik salam pembuka/intro! Pilih bagian pembahasan/tutorial/momen seru yang berbobot.
+- SEMUA TULISAN/TEXT HARUS DALAM BAHASA INDONESIA YANG SANTAI DAN MENARIK!
+
+Transkrip berserta timestamp:
 {segments_text[:6000]}
 
-Return your analysis as valid JSON ONLY:
+Kembalikan respon DALAM FORMAT JSON SAJA:
 {{
-  "start_time": "MM:SS format",
-  "end_time": "MM:SS format",
-  "start_seconds": float,
-  "end_seconds": float,
-  "clip_transcript": "the exact transcript of the selected clip",
-  "hook_strength": "score out of 10",
-  "hook_type": "emotional/educational/controversial/entertaining",
-  "hook_analysis": "brief explanation why this is viral-worthy",
-  "cta_tiktok_affiliate": "1 persuasive TikTok CTA optimized for affiliate marketing",
-  "virality_potential": "high/medium/low"
+  "start_seconds": float (detik awal),
+  "end_seconds": float (detik akhir, pastikan selisih end_seconds - start_seconds MINIMAL 25 detik!),
+  "clip_transcript": "transkrip lengkap dari klip yang dipilih",
+  "hook_strength": "skor dari 10 (contoh: 9/10)",
+  "hook_type": "Edukasi/Hiburan/Kontroversial/Emosional",
+  "hook_analysis": "alasan singkat kenapa bagian ini sangat menarik untuk audiens TikTok Indonesia",
+  "cta_tiktok_affiliate": "1 kalimat Call-to-Action persuasif Bahasa Indonesia cocok untuk jualan affiliate TikTok",
+  "virality_potential": "Sangat Tinggi/Tinggi/Sedang"
 }}"""
 
             response = await self.client.chat.completions.create(
@@ -462,8 +458,8 @@ Return your analysis as valid JSON ONLY:
                     {
                         "role": "system",
                         "content": (
-                            "You are a viral content strategist. Return ONLY valid"
-                            " JSON."
+                            "Kamu adalah pakar strategi konten TikTok Indonesia."
+                            " Return ONLY valid JSON dalam Bahasa Indonesia."
                         ),
                     },
                     {"role": "user", "content": prompt},
@@ -474,14 +470,17 @@ Return your analysis as valid JSON ONLY:
 
             analysis = json.loads(response.choices[0].message.content)
 
-            clip_duration = analysis["end_seconds"] - analysis["start_seconds"]
-            if (
-                clip_duration < Config.MIN_CLIP_DURATION
-                or clip_duration > Config.MAX_CLIP_DURATION
-            ):
-                analysis["end_seconds"] = min(
-                    analysis["start_seconds"] + 45, video_duration
-                )
+            # Force Guardrail Durasi
+            start_sec = float(analysis.get("start_seconds", 0))
+            end_sec = float(analysis.get("end_seconds", 30))
+
+            if (end_sec - start_sec) < Config.MIN_CLIP_DURATION:
+                end_sec = min(start_sec + 40, video_duration if video_duration > 0 else start_sec + 40)
+
+            analysis["start_seconds"] = start_sec
+            analysis["end_seconds"] = end_sec
+            analysis["start_time"] = time.strftime('%M:%S', time.gmtime(start_sec))
+            analysis["end_time"] = time.strftime('%M:%S', time.gmtime(end_sec))
 
             return analysis
 
@@ -491,11 +490,11 @@ Return your analysis as valid JSON ONLY:
 
     async def generate_smart_title(self, hook_analysis: Dict) -> str:
         try:
-            prompt = f"""Generate 1 viral TikTok-style title for this clip:
-Transcript: {hook_analysis['clip_transcript'][:200]}
-Hook Type: {hook_analysis['hook_type']}
+            prompt = f"""Buatkan 1 judul menarik Bahasa Indonesia gaya TikTok/Shorts yang bikin penasaran berdasarkan transkrip klip ini:
+Transkrip: {hook_analysis['clip_transcript'][:200]}
+Tipe Hook: {hook_analysis['hook_type']}
 
-Return as JSON: {{"title": "your viral title"}}"""
+Kembalikan format JSON: {{"title": "judul viral di sini #fyp #viral"}}"""
 
             response = await self.client.chat.completions.create(
                 model="llama-3.1-8b-instant",
@@ -505,9 +504,9 @@ Return as JSON: {{"title": "your viral title"}}"""
             )
 
             data = json.loads(response.choices[0].message.content)
-            return data.get("title", "🔥 Must Watch! #viral #fyp")
+            return data.get("title", "🔥 Trik Rahasia Yang Wajib Kamu Tahu! #fyp #viral")
         except:
-            return "🔥 Must Watch! #viral #fyp"
+            return "🔥 Trik Rahasia Yang Wajib Kamu Tahu! #fyp #viral"
 
 
 # ==================== VIDEO CLIPPER ====================
@@ -518,8 +517,11 @@ class VideoClipper:
         input_path: Path, output_path: Path, start_time: float, end_time: float
     ) -> Path:
         try:
-            logger.info(f"✂️ Clipping video: {start_time:.2f}s to {end_time:.2f}s")
+            logger.info(f"✂️ Clipping & Vertical Cropping (9:16): {start_time:.2f}s to {end_time:.2f}s")
             duration = max(1.0, end_time - start_time)
+
+            # Filter FFmpeg: Crop Center 9:16 Vertikal Penuh Tanpa Blackbar Atas-Bawah
+            crop_filter = "crop=ih*(9/16):ih,scale=1080:1920"
 
             cmd = [
                 Config.FFMPEG_PATH,
@@ -539,9 +541,8 @@ class VideoClipper:
                 "aac",
                 "-b:a",
                 "128k",
-                "-vf", (
-                    "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2"
-                ),
+                "-vf",
+                crop_filter,
                 str(output_path),
                 "-y",
             ]
@@ -691,7 +692,7 @@ class YouTubeClipperBot:
 
             # 4. Clip Video
             await self._update_status(
-                status_msg, "✂️ Memotong klip video 9:16...", 85
+                status_msg, "✂️ Memotong klip video 9:16 (Full Screen)...", 85
             )
             clipper = VideoClipper()
             clip_path = session.temp_dir / f"clip_{user_id}.mp4"
@@ -712,8 +713,8 @@ class YouTubeClipperBot:
 🏷️ *Judul Viral:* {smart_title}
 📹 *Video:* {metadata['title'][:100]}
 ⏱️ *Durasi Klip:* {hook_analysis['start_time']} - {hook_analysis['end_time']}
-🎯 *Kekuatan Hook:* {hook_analysis['hook_strength']}/10
-📊 *Tipe Hook:* {hook_analysis['hook_type'].title()}
+🎯 *Kekuatan Hook:* {hook_analysis['hook_strength']}
+📊 *Tipe Hook:* {hook_analysis['hook_type']}
 
 💡 *Analisis Hook:*
 {hook_analysis['hook_analysis']}
@@ -724,7 +725,7 @@ _{hook_analysis['clip_transcript'][:300]}_
 🛒 *CTA TikTok Affiliate:*
 "{hook_analysis['cta_tiktok_affiliate']}"
 
-✨ _Klip video vertical (9:16) siap diupload ke TikTok/Shorts!_
+✨ _Klip video vertical (9:16 Full Screen) siap diupload ke TikTok/Shorts!_
 """
             # Send Video with Caption
             with open(session.clip_path, "rb") as video_file:
