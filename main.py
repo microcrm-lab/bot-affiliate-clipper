@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 YouTube Video Clipper & AI Hook Finder Telegram Bot
-Created for Render.com Deployment (Dual-Engine Bypasser)
+Created for Render.com Deployment (pytubefix + Cobalt Fallback Engine)
 Python 3.10+
 """
 
@@ -37,9 +37,11 @@ from flask import Flask, jsonify
 
 # AI & Processing
 from groq import AsyncGroq
-import yt_dlp
 
-# Safe Auto-Install FFmpeg dengan sistem Retry Anti-Disconnect
+# YouTube Downloader Engine (pytubefix)
+from pytubefix import YouTube
+
+# Safe Auto-Install FFmpeg
 import static_ffmpeg
 
 
@@ -83,6 +85,9 @@ class Config:
     FLASK_PORT = int(os.getenv("PORT", 8080))
     FFMPEG_PATH = shutil.which("ffmpeg") or "ffmpeg"
 
+    # pytubefix token cache dir
+    PYTUBEFIX_TOKEN_DIR = BASE_DIR / ".pytubefix_tokens"
+
 
 # ==================== FLASK KEEP-ALIVE ====================
 class KeepAliveServer:
@@ -118,35 +123,61 @@ class KeepAliveServer:
 # ==================== YOUTUBE DOWNLOADER ====================
 class YouTubeDownloader:
     """
-    YouTube Downloader dengan Dual Engine:
-    1. Native yt-dlp (Mobile/VR Client + Cookies)
-    2. Auto-Fallback Engine (Cobalt API) jika IP Render Diblokir YouTube
+    YouTube Downloader Dual-Engine:
+    1. pytubefix (Multi-Client: ANDROID / IOS / TV_EMBED / WEB)
+    2. Auto-Fallback Engine (Cobalt API) jika seluruh client pytubefix diblokir YouTube
     """
 
+    # Urutan client dioptimasi dari yang paling ramah IP Datacenter
+    CLIENT_STRATEGIES = ["ANDROID", "IOS", "TV_EMBED", "WEB"]
+
     @staticmethod
-    def _find_downloaded_file(output_dir: Path, file_prefix: str) -> Optional[Path]:
-        valid_extensions = {".mp4", ".mkv", ".webm", ".m4v", ".mov"}
-        
-        candidate_files = [
-            f for f in output_dir.glob(f"{file_prefix}_*.*")
-            if f.suffix.lower() in valid_extensions 
-            and not f.name.endswith(".part") 
-            and not f.name.endswith(".ytdl")
-            and f.stat().st_size > 10000
-        ]
-        
-        if not candidate_files:
-            all_files = sorted(output_dir.glob("*.*"), key=lambda x: x.stat().st_mtime, reverse=True)
-            candidate_files = [f for f in all_files if f.suffix.lower() in valid_extensions and f.stat().st_size > 10000]
+    def _pick_best_stream(yt: "YouTube"):
+        """Pilih stream terbaik: progressive (video+audio gabung) agar tidak perlu merging"""
+        stream = (
+            yt.streams.get_highest_resolution()
+            or yt.streams.filter(progressive=True, file_extension="mp4")
+            .order_by("resolution")
+            .desc()
+            .first()
+            or yt.streams.filter(only_audio=False, file_extension="mp4")
+            .order_by("resolution")
+            .desc()
+            .first()
+            or yt.streams.first()
+        )
+        return stream
 
-        if candidate_files:
-            return candidate_files[0]
+    @staticmethod
+    def _download_with_pytubefix_sync(url: str, output_dir: Path, file_prefix: str, client: str):
+        Config.PYTUBEFIX_TOKEN_DIR.mkdir(parents=True, exist_ok=True)
 
-        return None
+        yt = YouTube(
+            url,
+            client=client,
+            use_oauth=False,
+            allow_oauth_cache=True,
+            token_file=str(Config.PYTUBEFIX_TOKEN_DIR / "tokens.json"),
+        )
+
+        stream = YouTubeDownloader._pick_best_stream(yt)
+        if not stream:
+            raise RuntimeError(f"Tidak ada stream tersedia untuk client {client}.")
+
+        ext = stream.subtype or "mp4"
+        filename = f"{file_prefix}_{yt.video_id}.{ext}"
+        out_file_path = stream.download(output_path=str(output_dir), filename=filename)
+
+        return {
+            "path": Path(out_file_path),
+            "title": yt.title or "YouTube Video",
+            "duration": int(yt.length or 0),
+            "video_id": yt.video_id or "",
+        }
 
     @staticmethod
     async def _cobalt_fallback_download(url: str, output_path: Path) -> bool:
-        """Engine Cadangan: Menembus IP Datacenter via Cobalt Bypasser API"""
+        """Fallback Engine via Cobalt Bypasser API"""
         def _download():
             try:
                 logger.info("🚀 [Fallback Engine] Mengunduh video via Cobalt Bypasser API...")
@@ -162,13 +193,13 @@ class YouTubeDownloader:
                 )
                 with urllib.request.urlopen(req, timeout=30) as response:
                     res_data = json.loads(response.read().decode('utf-8'))
-                    
+
                 dl_url = res_data.get("url")
                 if not dl_url and res_data.get("status") == "picker":
                     picker = res_data.get("picker", [])
                     if picker and len(picker) > 0:
                         dl_url = picker[0].get("url")
-                        
+
                 if dl_url:
                     dl_req = urllib.request.Request(dl_url, headers={"User-Agent": "Mozilla/5.0"})
                     with urllib.request.urlopen(dl_req, timeout=60) as dl_res, open(output_path, "wb") as f:
@@ -185,68 +216,43 @@ class YouTubeDownloader:
     async def download_video(url: str, output_dir: Path) -> Optional[Dict]:
         output_dir.mkdir(parents=True, exist_ok=True)
         file_prefix = f"vid_{uuid.uuid4().hex}"
-
-        # Engine 1: yt-dlp Strategies
-        strategies = [
-            {"clients": ["android_vr"], "fmt": "best/b"},
-            {"clients": ["tv"], "fmt": "best"},
-            {"clients": ["ios", "android"], "fmt": "b"},
-        ]
-
         last_error = None
 
-        for attempt, strat in enumerate(strategies, 1):
+        # Engine 1: pytubefix Strategies
+        for attempt, client in enumerate(YouTubeDownloader.CLIENT_STRATEGIES, 1):
             try:
-                logger.info(f"🔄 Mencoba yt-dlp strategi #{attempt} (Client: {strat['clients']})...")
-                
-                ydl_opts = {
-                    "outtmpl": str(Path(output_dir) / f"{file_prefix}_%(id)s.%(ext)s"),
-                    "merge_output_format": "mp4",
-                    "ffmpeg_location": Config.FFMPEG_PATH,
-                    "extractor_args": {
-                        "youtube": {
-                            "player_client": strat["clients"]
-                        }
-                    },
-                    "quiet": True,
-                    "no_warnings": True,
-                    "nocheckcertificate": True,
-                    "geo_bypass": True,
-                    "socket_timeout": 20,
-                    "retries": 3,
-                }
+                logger.info(f"🔄 Mencoba pytubefix strategi #{attempt} (Client: {client})...")
 
-                if strat["fmt"] is not None:
-                    ydl_opts["format"] = strat["fmt"]
+                result = await asyncio.to_thread(
+                    YouTubeDownloader._download_with_pytubefix_sync,
+                    url,
+                    output_dir,
+                    file_prefix,
+                    client,
+                )
 
-                cookie_file = Config.COOKIES_PATH
-                if cookie_file.exists():
-                    ydl_opts["cookiefile"] = str(cookie_file)
+                downloaded_file = result["path"]
 
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(url, download=True)
-                    downloaded_file = YouTubeDownloader._find_downloaded_file(output_dir, file_prefix)
+                if downloaded_file.exists() and downloaded_file.stat().st_size > 10000:
+                    logger.info(f"✅ Download Berhasil via pytubefix ({client}): {downloaded_file.name}")
+                    final_path = downloaded_file
+                    if downloaded_file.suffix.lower() != ".mp4":
+                        final_path = await YouTubeDownloader._convert_to_mp4(downloaded_file)
 
-                    if downloaded_file and downloaded_file.exists():
-                        logger.info(f"✅ Download Berhasil via yt-dlp: {downloaded_file.name}")
-                        final_path = downloaded_file
-                        if downloaded_file.suffix.lower() != '.mp4':
-                            final_path = await YouTubeDownloader._convert_to_mp4(downloaded_file)
-
-                        return {
-                            "video_path": final_path,
-                            "title": info.get("title", "YouTube Video"),
-                            "duration": info.get("duration", 0),
-                            "video_id": info.get("id", ""),
-                        }
+                    return {
+                        "video_path": final_path,
+                        "title": result["title"],
+                        "duration": result["duration"],
+                        "video_id": result["video_id"],
+                    }
 
             except Exception as e:
-                logger.warning(f"⚠️ yt-dlp Strategi #{attempt} gagal: {e}")
+                logger.warning(f"⚠️ pytubefix Strategi #{attempt} ({client}) gagal: {e}")
                 last_error = e
                 await asyncio.sleep(1)
 
-        # Engine 2: Fallback Bypasser API (Penyelamat jika IP Render Diblokir Total)
-        logger.warning("🛡️ IP Render terdeteksi diblokir total oleh YouTube. Mengaktifkan Fallback Engine (Cobalt Bypasser)...")
+        # Engine 2: Fallback Bypasser API
+        logger.warning("🛡️ Seluruh client pytubefix gagal. Mengaktifkan Fallback Engine (Cobalt Bypasser)...")
         fallback_file = Path(output_dir) / f"{file_prefix}_fallback.mp4"
         success = await YouTubeDownloader._cobalt_fallback_download(url, fallback_file)
 
@@ -274,7 +280,7 @@ class YouTubeDownloader:
                 "-crf", "23", "-c:a", "aac", "-b:a", "128k",
                 "-movflags", "+faststart", str(output_path), "-y"
             ]
-            
+
             process = await asyncio.create_subprocess_exec(
                 *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
             )
