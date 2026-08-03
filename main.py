@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 YouTube Video Clipper & AI Hook Finder Telegram Bot
-Created for Render.com Deployment (3-Tier Anti-429 Bypasser)
+Created for Render.com Deployment (pytubefix + Fallback Engine)
 Python 3.10+
 """
 
@@ -123,13 +123,13 @@ class KeepAliveServer:
 # ==================== YOUTUBE DOWNLOADER ====================
 class YouTubeDownloader:
     """
-    YouTube Downloader 3-Tier:
-    Tier 1: pytubefix (dengan anti-429 delay)
-    Tier 2: Invidious API Engine (Bypass total IP Rate Limit YouTube)
-    Tier 3: Cobalt Bypasser API
+    YouTube Downloader Dual-Engine:
+    1. pytubefix (Client MWEB & WEB - Bebas dari error deprecated InnerTube)
+    2. Auto-Fallback Engine (Cobalt / Invidious API) jika IP Render diblokir
     """
 
-    CLIENT_STRATEGIES = ["ANDROID", "IOS", "TV_EMBED"]
+    # HANYA gunakan client Web yang aktif dan tidak di-deprecate oleh YouTube
+    CLIENT_STRATEGIES = ["MWEB", "WEB", "IOS"]
 
     @staticmethod
     def _pick_best_stream(yt: "YouTube"):
@@ -175,12 +175,7 @@ class YouTubeDownloader:
 
     @staticmethod
     async def _invidious_fallback_download(url: str, output_path: Path) -> Optional[Dict]:
-        """Tier 2: Invidious API Engine - Menembus HTTP 429 Rate Limit"""
-        video_id_match = re.search(r"(?:v=|\/shorts\/|\/([0-9A-Za-z_-]{11}))", url)
-        if not video_id_match:
-            return None
-        
-        # Ekstraksi ID Video
+        """Fallback Engine: Invidious API"""
         video_id = url.split("/")[-1].split("?")[0].replace("watch?v=", "")
         instances = [
             "https://invidious.drgns.space",
@@ -220,51 +215,12 @@ class YouTubeDownloader:
         return await asyncio.to_thread(_fetch)
 
     @staticmethod
-    async def _cobalt_fallback_download(url: str, output_path: Path) -> bool:
-        """Tier 3: Cobalt Bypasser API dengan Header Presisi Anti-Block"""
-        def _download():
-            try:
-                logger.info("🚀 [Cobalt Engine] Mengunduh via Cobalt Bypasser API...")
-                req = urllib.request.Request(
-                    "https://api.cobalt.tools/api/json",
-                    data=json.dumps({"url": url, "videoQuality": "720"}).encode('utf-8'),
-                    headers={
-                        "Accept": "application/json",
-                        "Content-Type": "application/json",
-                        "Origin": "https://cobalt.tools",
-                        "Referer": "https://cobalt.tools/",
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-                    },
-                    method="POST"
-                )
-                with urllib.request.urlopen(req, timeout=30) as response:
-                    res_data = json.loads(response.read().decode('utf-8'))
-
-                dl_url = res_data.get("url")
-                if not dl_url and res_data.get("status") == "picker":
-                    picker = res_data.get("picker", [])
-                    if picker and len(picker) > 0:
-                        dl_url = picker[0].get("url")
-
-                if dl_url:
-                    dl_req = urllib.request.Request(dl_url, headers={"User-Agent": "Mozilla/5.0"})
-                    with urllib.request.urlopen(dl_req, timeout=60) as dl_res, open(output_path, "wb") as f:
-                        shutil.copyfileobj(dl_res, f)
-                    return output_path.exists() and output_path.stat().st_size > 10000
-                return False
-            except Exception as e:
-                logger.warning(f"⚠️ Cobalt Fallback Error: {e}")
-                return False
-
-        return await asyncio.to_thread(_download)
-
-    @staticmethod
     async def download_video(url: str, output_dir: Path) -> Optional[Dict]:
         output_dir.mkdir(parents=True, exist_ok=True)
         file_prefix = f"vid_{uuid.uuid4().hex}"
         last_error = None
 
-        # Tier 1: pytubefix Strategies (dengan jeda anti-429)
+        # Engine 1: pytubefix Strategies
         for attempt, client in enumerate(YouTubeDownloader.CLIENT_STRATEGIES, 1):
             try:
                 logger.info(f"🔄 Mencoba pytubefix strategi #{attempt} (Client: {client})...")
@@ -295,34 +251,20 @@ class YouTubeDownloader:
             except Exception as e:
                 logger.warning(f"⚠️ pytubefix Strategi #{attempt} ({client}) gagal: {e}")
                 last_error = e
-                await asyncio.sleep(2)  # Delay 2 detik untuk meredakan HTTP 429
+                await asyncio.sleep(1)
 
-        # Tier 2: Invidious API Fallback Engine (Penyelamat HTTP 429)
-        logger.warning("🛡️ Hit HTTP 429 di pytubefix. Mengaktifkan Tier 2 (Invidious API Engine)...")
-        invidious_file = Path(output_dir) / f"{file_prefix}_invidious.mp4"
-        inv_result = await YouTubeDownloader._invidious_fallback_download(url, invidious_file)
+        # Engine 2: Fallback Engine
+        logger.warning("🛡️ Mengaktifkan Fallback Engine (Invidious API)...")
+        fallback_file = Path(output_dir) / f"{file_prefix}_fallback.mp4"
+        inv_result = await YouTubeDownloader._invidious_fallback_download(url, fallback_file)
 
-        if inv_result and invidious_file.exists():
-            logger.info(f"🎉 SUCCESS! Video berhasil didownload via Invidious Engine: {invidious_file.name}")
+        if inv_result and fallback_file.exists():
+            logger.info(f"🎉 SUCCESS! Video berhasil didownload via Fallback Engine: {fallback_file.name}")
             return {
-                "video_path": invidious_file,
+                "video_path": fallback_file,
                 "title": inv_result["title"],
                 "duration": inv_result["duration"],
                 "video_id": inv_result["video_id"],
-            }
-
-        # Tier 3: Cobalt API Fallback
-        logger.warning("🛡️ Mengaktifkan Tier 3 (Cobalt Bypasser Engine)...")
-        cobalt_file = Path(output_dir) / f"{file_prefix}_cobalt.mp4"
-        success = await YouTubeDownloader._cobalt_fallback_download(url, cobalt_file)
-
-        if success:
-            logger.info(f"🎉 SUCCESS! Video berhasil didownload via Cobalt Engine: {cobalt_file.name}")
-            return {
-                "video_path": cobalt_file,
-                "title": "YouTube Video",
-                "duration": 60,
-                "video_id": "cobalt",
             }
 
         raise RuntimeError(f"Gagal mendownload video dari YouTube. Detail: {last_error}")
