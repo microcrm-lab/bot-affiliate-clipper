@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 YouTube Video Clipper & AI Hook Finder Telegram Bot
-Created for Render.com Deployment (Webshare Proxy + AI Prompt Fix + Vertical Crop)
+Created for Render.com Deployment (yt-dlp + Webshare Proxy + AI Prompt Fix + Vertical Crop)
 Python 3.10+
 """
 
@@ -39,7 +39,8 @@ from flask import Flask, jsonify
 # AI & Processing
 from groq import AsyncGroq
 
-# YouTube Downloader Engine (pytubefix)
+# Downloader Engines
+import yt_dlp
 from pytubefix import YouTube
 
 # Safe Auto-Install FFmpeg
@@ -80,7 +81,7 @@ class Config:
     TEMP_DIR = Path("/tmp/yt_clipper_bot")
 
     MAX_CLIP_DURATION = 60  # seconds
-    MIN_CLIP_DURATION = 20  # minimal 20 detik agar tidak kepotong 2 detik lagi
+    MIN_CLIP_DURATION = 20  # minimal 20 detik
     USER_TIMEOUT = 300  # 5 minutes
 
     FLASK_PORT = int(os.getenv("PORT", 8080))
@@ -92,19 +93,7 @@ class Config:
         "http://ymfbkidl:s2rh40rg42t9@31.59.20.176:6754/"
     )
 
-    # pytubefix token cache dir
     PYTUBEFIX_TOKEN_DIR = BASE_DIR / ".pytubefix_tokens"
-
-
-# Setup Global Proxy
-if Config.WEBSHARE_PROXY:
-    proxy_support = urllib.request.ProxyHandler({
-        "http": Config.WEBSHARE_PROXY,
-        "https": Config.WEBSHARE_PROXY
-    })
-    opener = urllib.request.build_opener(proxy_support)
-    urllib.request.install_opener(opener)
-    logger.info("🌐 Webshare Proxy diaktifkan!")
 
 
 # ==================== FLASK KEEP-ALIVE ====================
@@ -140,153 +129,108 @@ class KeepAliveServer:
 
 # ==================== YOUTUBE DOWNLOADER ====================
 class YouTubeDownloader:
-
-    CLIENT_STRATEGIES = ["MWEB", "WEB", "IOS"]
-
-    @staticmethod
-    def _pick_best_stream(yt: "YouTube"):
-        return (
-            yt.streams.get_highest_resolution()
-            or yt.streams.filter(progressive=True, file_extension="mp4")
-            .order_by("resolution")
-            .desc()
-            .first()
-            or yt.streams.filter(only_audio=False, file_extension="mp4")
-            .order_by("resolution")
-            .desc()
-            .first()
-            or yt.streams.first()
-        )
+    """
+    YouTube Downloader Multi-Engine:
+    Engine 1: yt-dlp + Webshare Proxy (Sangat Stabil)
+    Engine 2: pytubefix + Webshare Proxy
+    """
 
     @staticmethod
-    def _download_with_pytubefix_sync(url: str, output_dir: Path, file_prefix: str, client: str):
-        Config.PYTUBEFIX_TOKEN_DIR.mkdir(parents=True, exist_ok=True)
-
-        proxies = None
-        if Config.WEBSHARE_PROXY:
-            proxies = {
-                "http": Config.WEBSHARE_PROXY,
-                "https": Config.WEBSHARE_PROXY
-            }
-
-        yt = YouTube(
-            url,
-            client=client,
-            proxies=proxies,
-            use_oauth=False,
-            allow_oauth_cache=True,
-            token_file=str(Config.PYTUBEFIX_TOKEN_DIR / "tokens.json"),
-        )
-
-        stream = YouTubeDownloader._pick_best_stream(yt)
-        if not stream:
-            raise RuntimeError(f"Tidak ada stream tersedia untuk client {client}.")
-
-        ext = stream.subtype or "mp4"
-        filename = f"{file_prefix}_{yt.video_id}.{ext}"
-        out_file_path = stream.download(output_path=str(output_dir), filename=filename)
-
-        return {
-            "path": Path(out_file_path),
-            "title": yt.title or "YouTube Video",
-            "duration": int(yt.length or 0),
-            "video_id": yt.video_id or "",
-        }
-
-    @staticmethod
-    async def _invidious_fallback_download(url: str, output_path: Path) -> Optional[Dict]:
-        video_id = url.split("/")[-1].split("?")[0].replace("watch?v=", "")
-        instances = [
-            "https://invidious.drgns.space",
-            "https://inv.tux.pizza",
-            "https://invidious.nerdvpn.de",
-            "https://vid.puppethead.com"
+    def _find_downloaded_file(output_dir: Path, file_prefix: str) -> Optional[Path]:
+        valid_extensions = {".mp4", ".mkv", ".webm", ".m4v", ".mov"}
+        
+        candidate_files = [
+            f for f in output_dir.glob(f"{file_prefix}_*.*")
+            if f.suffix.lower() in valid_extensions 
+            and not f.name.endswith(".part") 
+            and not f.name.endswith(".ytdl")
+            and f.stat().st_size > 10000
         ]
+        
+        if not candidate_files:
+            all_files = sorted(output_dir.glob("*.*"), key=lambda x: x.stat().st_mtime, reverse=True)
+            candidate_files = [f for f in all_files if f.suffix.lower() in valid_extensions and f.stat().st_size > 10000]
 
-        def _fetch():
-            for instance in instances:
-                try:
-                    logger.info(f"🚀 [Invidious Engine] Mencoba node: {instance}...")
-                    api_url = f"{instance}/api/v1/videos/{video_id}"
-                    req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
-                    
-                    with urllib.request.urlopen(req, timeout=10) as resp:
-                        data = json.loads(resp.read().decode())
+        if candidate_files:
+            return candidate_files[0]
 
-                    format_streams = data.get("formatStreams", [])
-                    title = data.get("title", "YouTube Video")
-                    duration = int(data.get("lengthSeconds", 60))
-
-                    if format_streams:
-                        best_fmt = format_streams[-1]
-                        itag = best_fmt.get("itag")
-                        proxy_stream_url = f"{instance}/latest_version?id={video_id}&itag={itag}&local=true"
-                        
-                        dl_req = urllib.request.Request(proxy_stream_url, headers={"User-Agent": "Mozilla/5.0"})
-                        with urllib.request.urlopen(dl_req, timeout=60) as dl_res, open(output_path, "wb") as f:
-                            shutil.copyfileobj(dl_res, f)
-                        
-                        if output_path.exists() and output_path.stat().st_size > 10000:
-                            return {"title": title, "duration": duration, "video_id": video_id}
-                except Exception as e:
-                    logger.warning(f"⚠️ Invidious node {instance} gagal: {e}")
-                    continue
-            return None
-
-        return await asyncio.to_thread(_fetch)
+        return None
 
     @staticmethod
     async def download_video(url: str, output_dir: Path) -> Optional[Dict]:
         output_dir.mkdir(parents=True, exist_ok=True)
         file_prefix = f"vid_{uuid.uuid4().hex}"
-        last_error = None
 
-        for attempt, client in enumerate(YouTubeDownloader.CLIENT_STRATEGIES, 1):
-            try:
-                logger.info(f"🔄 [Webshare Proxy] Mencoba pytubefix strategi #{attempt} (Client: {client})...")
-
-                result = await asyncio.to_thread(
-                    YouTubeDownloader._download_with_pytubefix_sync,
-                    url,
-                    output_dir,
-                    file_prefix,
-                    client,
-                )
-
-                downloaded_file = result["path"]
-
-                if downloaded_file.exists() and downloaded_file.stat().st_size > 10000:
-                    logger.info(f"✅ Download Berhasil via Webshare Proxy + pytubefix ({client}): {downloaded_file.name}")
-                    final_path = downloaded_file
-                    if downloaded_file.suffix.lower() != ".mp4":
-                        final_path = await YouTubeDownloader._convert_to_mp4(downloaded_file)
-
-                    return {
-                        "video_path": final_path,
-                        "title": result["title"],
-                        "duration": result["duration"],
-                        "video_id": result["video_id"],
-                    }
-
-            except Exception as e:
-                logger.warning(f"⚠️ pytubefix Strategi #{attempt} ({client}) gagal: {e}")
-                last_error = e
-                await asyncio.sleep(1)
-
-        logger.warning("🛡️ Mengaktifkan Fallback Engine (Invidious Proxied Stream)...")
-        fallback_file = Path(output_dir) / f"{file_prefix}_fallback.mp4"
-        inv_result = await YouTubeDownloader._invidious_fallback_download(url, fallback_file)
-
-        if inv_result and fallback_file.exists() and fallback_file.stat().st_size > 10000:
-            logger.info(f"🎉 SUCCESS! Video berhasil didownload via Fallback Engine: {fallback_file.name}")
-            return {
-                "video_path": fallback_file,
-                "title": inv_result["title"],
-                "duration": inv_result["duration"],
-                "video_id": inv_result["video_id"],
+        # ENGINE 1: yt-dlp lewat Webshare Proxy (Jalur Utama Anti-Block)
+        try:
+            logger.info("🚀 [Engine 1] Mendownload via yt-dlp + Webshare Proxy...")
+            ydl_opts = {
+                "outtmpl": str(Path(output_dir) / f"{file_prefix}_%(id)s.%(ext)s"),
+                "merge_output_format": "mp4",
+                "ffmpeg_location": Config.FFMPEG_PATH,
+                "proxy": Config.WEBSHARE_PROXY,
+                "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+                "quiet": True,
+                "no_warnings": True,
+                "nocheckcertificate": True,
+                "geo_bypass": True,
+                "socket_timeout": 30,
+                "retries": 5,
             }
 
-        raise RuntimeError(f"Gagal mendownload video dari YouTube. Detail: {last_error}")
+            cookie_file = Config.COOKIES_PATH
+            if cookie_file.exists():
+                ydl_opts["cookiefile"] = str(cookie_file)
+
+            def _ytdlp_exec():
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    return info
+
+            info = await asyncio.to_thread(_ytdlp_exec)
+            downloaded_file = YouTubeDownloader._find_downloaded_file(output_dir, file_prefix)
+
+            if downloaded_file and downloaded_file.exists() and downloaded_file.stat().st_size > 10000:
+                logger.info(f"✅ SUCCESS! Download Berhasil via yt-dlp Engine: {downloaded_file.name}")
+                final_path = downloaded_file
+                if downloaded_file.suffix.lower() != ".mp4":
+                    final_path = await YouTubeDownloader._convert_to_mp4(downloaded_file)
+
+                return {
+                    "video_path": final_path,
+                    "title": info.get("title", "YouTube Video"),
+                    "duration": info.get("duration", 0),
+                    "video_id": info.get("id", ""),
+                }
+
+        except Exception as e:
+            logger.warning(f"⚠️ Engine 1 (yt-dlp) gagal: {e}")
+
+        # ENGINE 2: pytubefix Fallback
+        try:
+            logger.info("🛡️ [Engine 2] Mencoba pytubefix Fallback...")
+            proxies = {"http": Config.WEBSHARE_PROXY, "https": Config.WEBSHARE_PROXY}
+            
+            def _pytubefix_exec():
+                yt = YouTube(url, client="MWEB", proxies=proxies)
+                stream = yt.streams.get_highest_resolution() or yt.streams.first()
+                filename = f"{file_prefix}_{yt.video_id}.mp4"
+                out_path = stream.download(output_path=str(output_dir), filename=filename)
+                return Path(out_path), yt.title, yt.length, yt.video_id
+
+            out_file, title, length, vid_id = await asyncio.to_thread(_pytubefix_exec)
+            if out_file.exists() and out_file.stat().st_size > 10000:
+                logger.info(f"🎉 SUCCESS! Download via pytubefix: {out_file.name}")
+                return {
+                    "video_path": out_file,
+                    "title": title or "YouTube Video",
+                    "duration": length or 0,
+                    "video_id": vid_id or "",
+                }
+        except Exception as e:
+            logger.warning(f"⚠️ Engine 2 (pytubefix) gagal: {e}")
+
+        raise RuntimeError("Gagal mendownload video dari YouTube setelah mencoba seluruh engine.")
 
     @staticmethod
     async def _convert_to_mp4(input_path: Path) -> Path:
@@ -520,7 +464,7 @@ class VideoClipper:
             logger.info(f"✂️ Clipping & Vertical Cropping (9:16): {start_time:.2f}s to {end_time:.2f}s")
             duration = max(1.0, end_time - start_time)
 
-            # Filter FFmpeg: Crop Center 9:16 Vertikal Penuh Tanpa Blackbar Atas-Bawah
+            # Filter FFmpeg: Crop Center 9:16 Vertikal Penuh
             crop_filter = "crop=ih*(9/16):ih,scale=1080:1920"
 
             cmd = [
