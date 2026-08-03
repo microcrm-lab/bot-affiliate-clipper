@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 YouTube Video Clipper & AI Hook Finder Telegram Bot
-Created for Render.com Deployment (IP-Bound Bypasser with Proxied Stream)
+Created for Render.com Deployment (Webshare Proxy Engine)
 Python 3.10+
 """
 
@@ -86,8 +86,25 @@ class Config:
     FLASK_PORT = int(os.getenv("PORT", 8080))
     FFMPEG_PATH = shutil.which("ffmpeg") or "ffmpeg"
 
+    # Webshare Proxy Configuration (Membypass Blokir IP Datacenter Render)
+    WEBSHARE_PROXY = os.getenv(
+        "WEBSHARE_PROXY",
+        "http://ymfbkidl:s2rh40rg42t9@31.59.20.176:6754/"
+    )
+
     # pytubefix token cache dir
     PYTUBEFIX_TOKEN_DIR = BASE_DIR / ".pytubefix_tokens"
+
+
+# Setup Global Proxy untuk urllib Request
+if Config.WEBSHARE_PROXY:
+    proxy_support = urllib.request.ProxyHandler({
+        "http": Config.WEBSHARE_PROXY,
+        "https": Config.WEBSHARE_PROXY
+    })
+    opener = urllib.request.build_opener(proxy_support)
+    urllib.request.install_opener(opener)
+    logger.info("🌐 Webshare Proxy berhasil diaktifkan secara global!")
 
 
 # ==================== FLASK KEEP-ALIVE ====================
@@ -124,10 +141,7 @@ class KeepAliveServer:
 # ==================== YOUTUBE DOWNLOADER ====================
 class YouTubeDownloader:
     """
-    YouTube Downloader Multi-Engine Bypasser:
-    Engine 1: pytubefix (Web Mobile Client)
-    Engine 2: Invidious Proxied Stream (`local=true` - Bypass HTTP 400 Bad Request)
-    Engine 3: Cobalt Tunnel API
+    YouTube Downloader dengan Webshare Proxy Bypasser
     """
 
     CLIENT_STRATEGIES = ["MWEB", "WEB", "IOS"]
@@ -151,9 +165,17 @@ class YouTubeDownloader:
     def _download_with_pytubefix_sync(url: str, output_dir: Path, file_prefix: str, client: str):
         Config.PYTUBEFIX_TOKEN_DIR.mkdir(parents=True, exist_ok=True)
 
+        proxies = None
+        if Config.WEBSHARE_PROXY:
+            proxies = {
+                "http": Config.WEBSHARE_PROXY,
+                "https": Config.WEBSHARE_PROXY
+            }
+
         yt = YouTube(
             url,
             client=client,
+            proxies=proxies,
             use_oauth=False,
             allow_oauth_cache=True,
             token_file=str(Config.PYTUBEFIX_TOKEN_DIR / "tokens.json"),
@@ -175,33 +197,20 @@ class YouTubeDownloader:
         }
 
     @staticmethod
-    async def _invidious_proxied_download(url: str, output_path: Path) -> Optional[Dict]:
-        """Engine 2: Invidious Proxied Stream (Menggunakan local=true agar aman dari HTTP 400)"""
-        # Ekstraksi ID Video dari URL
-        video_id = None
-        match = re.search(r"(?:v=|\/shorts\/|youtu\.be\/|\/([0-9A-Za-z_-]{11}))", url)
-        if "shorts/" in url:
-            video_id = url.split("shorts/")[-1].split("?")[0]
-        elif "v=" in url:
-            video_id = url.split("v=")[-1].split("&")[0]
-        elif "youtu.be/" in url:
-            video_id = url.split("youtu.be/")[-1].split("?")[0]
-
-        if not video_id or len(video_id) < 5:
-            video_id = url.split("/")[-1].split("?")[0]
-
+    async def _invidious_fallback_download(url: str, output_path: Path) -> Optional[Dict]:
+        """Fallback Engine via Invidious Node"""
+        video_id = url.split("/")[-1].split("?")[0].replace("watch?v=", "")
         instances = [
             "https://invidious.drgns.space",
             "https://inv.tux.pizza",
             "https://invidious.nerdvpn.de",
-            "https://vid.puppethead.com",
-            "https://invidious.projectsegfau.lt"
+            "https://vid.puppethead.com"
         ]
 
         def _fetch():
             for instance in instances:
                 try:
-                    logger.info(f"🚀 [Invidious Engine] Mencoba proxied node: {instance}...")
+                    logger.info(f"🚀 [Invidious Engine] Mencoba node: {instance}...")
                     api_url = f"{instance}/api/v1/videos/{video_id}"
                     req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
                     
@@ -213,12 +222,8 @@ class YouTubeDownloader:
                     duration = int(data.get("lengthSeconds", 60))
 
                     if format_streams:
-                        # Ambil itag dari format mp4 terbaik
                         best_fmt = format_streams[-1]
                         itag = best_fmt.get("itag")
-                        
-                        # Bypasser Utama: Minta Invidious mem-proxy stream secara internal (local=true)
-                        # Ini mencegah HTTP 400 Bad Request karena link dipipa dari server Invidious
                         proxy_stream_url = f"{instance}/latest_version?id={video_id}&itag={itag}&local=true"
                         
                         dl_req = urllib.request.Request(proxy_stream_url, headers={"User-Agent": "Mozilla/5.0"})
@@ -235,59 +240,15 @@ class YouTubeDownloader:
         return await asyncio.to_thread(_fetch)
 
     @staticmethod
-    async def _cobalt_fallback_download(url: str, output_path: Path) -> bool:
-        """Engine 3: Cobalt Bypasser API Tunnel"""
-        def _download():
-            endpoints = [
-                "https://api.cobalt.tools/api/json",
-                "https://co.wuk.sh/api/json"
-            ]
-            for endpoint in endpoints:
-                try:
-                    logger.info(f"🚀 [Cobalt Engine] Mengunduh via Cobalt API ({endpoint})...")
-                    req = urllib.request.Request(
-                        endpoint,
-                        data=json.dumps({"url": url, "videoQuality": "720"}).encode('utf-8'),
-                        headers={
-                            "Accept": "application/json",
-                            "Content-Type": "application/json",
-                            "Origin": "https://cobalt.tools",
-                            "Referer": "https://cobalt.tools/",
-                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-                        },
-                        method="POST"
-                    )
-                    with urllib.request.urlopen(req, timeout=25) as response:
-                        res_data = json.loads(response.read().decode('utf-8'))
-
-                    dl_url = res_data.get("url")
-                    if not dl_url and res_data.get("status") == "picker":
-                        picker = res_data.get("picker", [])
-                        if picker and len(picker) > 0:
-                            dl_url = picker[0].get("url")
-
-                    if dl_url:
-                        dl_req = urllib.request.Request(dl_url, headers={"User-Agent": "Mozilla/5.0"})
-                        with urllib.request.urlopen(dl_req, timeout=60) as dl_res, open(output_path, "wb") as f:
-                            shutil.copyfileobj(dl_res, f)
-                        return output_path.exists() and output_path.stat().st_size > 10000
-                except Exception as e:
-                    logger.warning(f"⚠️ Cobalt API endpoint {endpoint} gagal: {e}")
-                    continue
-            return False
-
-        return await asyncio.to_thread(_download)
-
-    @staticmethod
     async def download_video(url: str, output_dir: Path) -> Optional[Dict]:
         output_dir.mkdir(parents=True, exist_ok=True)
         file_prefix = f"vid_{uuid.uuid4().hex}"
         last_error = None
 
-        # Engine 1: pytubefix Strategies
+        # Engine 1: pytubefix + Webshare Proxy
         for attempt, client in enumerate(YouTubeDownloader.CLIENT_STRATEGIES, 1):
             try:
-                logger.info(f"🔄 Mencoba pytubefix strategi #{attempt} (Client: {client})...")
+                logger.info(f"🔄 [Webshare Proxy] Mencoba pytubefix strategi #{attempt} (Client: {client})...")
 
                 result = await asyncio.to_thread(
                     YouTubeDownloader._download_with_pytubefix_sync,
@@ -300,7 +261,7 @@ class YouTubeDownloader:
                 downloaded_file = result["path"]
 
                 if downloaded_file.exists() and downloaded_file.stat().st_size > 10000:
-                    logger.info(f"✅ Download Berhasil via pytubefix ({client}): {downloaded_file.name}")
+                    logger.info(f"✅ Download Berhasil via Webshare Proxy + pytubefix ({client}): {downloaded_file.name}")
                     final_path = downloaded_file
                     if downloaded_file.suffix.lower() != ".mp4":
                         final_path = await YouTubeDownloader._convert_to_mp4(downloaded_file)
@@ -317,35 +278,21 @@ class YouTubeDownloader:
                 last_error = e
                 await asyncio.sleep(1)
 
-        # Engine 2: Invidious Proxied Stream Fallback
-        logger.warning("🛡️ Mengaktifkan Engine 2 (Invidious Proxied Stream Engine)...")
-        invidious_file = Path(output_dir) / f"{file_prefix}_invidious.mp4"
-        inv_result = await YouTubeDownloader._invidious_proxied_download(url, invidious_file)
+        # Engine 2: Fallback Engine
+        logger.warning("🛡️ Mengaktifkan Fallback Engine (Invidious Proxied Stream)...")
+        fallback_file = Path(output_dir) / f"{file_prefix}_fallback.mp4"
+        inv_result = await YouTubeDownloader._invidious_fallback_download(url, fallback_file)
 
-        if inv_result and invidious_file.exists() and invidious_file.stat().st_size > 10000:
-            logger.info(f"🎉 SUCCESS! Video berhasil didownload via Invidious Engine: {invidious_file.name}")
+        if inv_result and fallback_file.exists() and fallback_file.stat().st_size > 10000:
+            logger.info(f"🎉 SUCCESS! Video berhasil didownload via Fallback Engine: {fallback_file.name}")
             return {
-                "video_path": invidious_file,
+                "video_path": fallback_file,
                 "title": inv_result["title"],
                 "duration": inv_result["duration"],
                 "video_id": inv_result["video_id"],
             }
 
-        # Engine 3: Cobalt Tunnel API Fallback
-        logger.warning("🛡️ Mengaktifkan Engine 3 (Cobalt Tunnel Engine)...")
-        cobalt_file = Path(output_dir) / f"{file_prefix}_cobalt.mp4"
-        success = await YouTubeDownloader._cobalt_fallback_download(url, cobalt_file)
-
-        if success and cobalt_file.exists() and cobalt_file.stat().st_size > 10000:
-            logger.info(f"🎉 SUCCESS! Video berhasil didownload via Cobalt Engine: {cobalt_file.name}")
-            return {
-                "video_path": cobalt_file,
-                "title": "YouTube Video",
-                "duration": 60,
-                "video_id": "cobalt",
-            }
-
-        raise RuntimeError(f"Gagal mendownload video dari YouTube setelah mencoba semua engine. Detail: {last_error}")
+        raise RuntimeError(f"Gagal mendownload video dari YouTube. Detail: {last_error}")
 
     @staticmethod
     async def _convert_to_mp4(input_path: Path) -> Path:
