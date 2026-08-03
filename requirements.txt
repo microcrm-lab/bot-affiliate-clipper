@@ -2,6 +2,7 @@ python-telegram-bot>=20.8
 flask>=3.0.0
 gunicorn>=21.2.0
 groq>=0.4.2
+yt-dlp
 pytubefix
 static-ffmpeg>=2.7
 requests>=2.31.0
